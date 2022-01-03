@@ -22,7 +22,7 @@ LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft \
 
 # flags
 STCPPFLAGS = -DVERSION=\"$(VERSION)\" -D_XOPEN_SOURCE=600
-STCFLAGS = $(INCS) $(STCPPFLAGS) $(CPPFLAGS) $(CFLAGS)
+STCFLAGS = $(INCS) $(STCPPFLAGS) $(CPPFLAGS) -Os -g3 -Wall -Wpedantic
 STLDFLAGS = $(LIBS) $(LDFLAGS)
 
 # OpenBSD:
