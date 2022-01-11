@@ -4,3 +4,4 @@
 -I/usr/include/glib-2.0
 -I/usr/include/libpng16
 -I/usr/lib/glib-2.0/include
+-D_XOPEN_SOURCE

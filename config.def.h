@@ -1,5 +1,45 @@
 /* See LICENSE file for copyright and license details. */
 
+#include "win.h"
+#undef Glyph
+#include <unistd.h>
+#include <X11/cursorfont.h>
+#include <X11/Xft/Xft.h>
+
+/* types used in config.h */
+typedef struct {
+	uint mod;
+	KeySym keysym;
+	void (*func)(const Arg *);
+	const Arg arg;
+} Shortcut;
+
+/* X modifiers */
+#define XK_ANY_MOD    UINT_MAX
+#define XK_NO_MOD     0
+#define XK_SWITCH_MOD (1<<13|1<<14)
+
+// default functions used for the config
+// for the funtions implementation see the x.c file
+static void numlock(const Arg *);
+static void zoom(const Arg *);
+static void zoomabs(const Arg *);
+static void zoomreset(const Arg *);
+static void cursor_move_x_relative(const Arg* arg);
+static void cursor_move_y_relative(const Arg* arg);
+static void save_buffer(const Arg* arg);
+static void toggle_selection(const Arg* arg);
+static void move_cursor_to_offset(const Arg* arg);
+static void move_cursor_to_end_of_buffer(const Arg* arg);
+static void clipboard_copy(const Arg* arg);
+static void clipboard_paste(const Arg* arg);
+static void undo(const Arg* arg);
+static void redo(const Arg* arg);
+
+static void cursor_callback(struct window_buffer* buf, enum cursor_reason callback_reason);
+
+static void buffer_content_callback(struct file_buffer* buffer, int offset, enum buffer_content_reason reason);
+
 //TODO: make this file friendly to IDE's
 
 /*
@@ -61,11 +101,9 @@ static const char *colorname[] = {
  * Default colors (colorname index)
  * foreground, background, cursor, reverse cursor
  */
-unsigned int defaultfg = 7;
-unsigned int defaultbg = 0;
+Glyph_ default_attributes = {.bg = 0, .fg = 7};
 static unsigned int defaultcs = 256;
 
-int default_mode = MODE_UTF8;
 int undo_buffers = 32;
 
 /*
@@ -97,8 +135,8 @@ static unsigned int mousebg = 0;
  */
 static unsigned int defaultattr = 11;
 
-void(*cursor_movement_callback)(int, int, enum cursor_reason) = cursor_callback;
-void(*buffer_contents_updated)(Buffer*, int, int, enum buffer_content_reason) = buffer_content_callback;
+void(*cursor_movement_callback)(struct window_buffer*, enum cursor_reason) = cursor_callback;
+void(*buffer_contents_updated)(struct file_buffer*, int, enum buffer_content_reason) = buffer_content_callback;
 
 /* Internal keyboard shortcuts. */
 #define MODKEY Mod1Mask

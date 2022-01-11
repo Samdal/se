@@ -15,50 +15,17 @@
 #include <X11/Xft/Xft.h>
 #include <X11/XKBlib.h>
 
-#include "st.h"
 #include "win.h"
-
-/* types used in config.h */
-typedef struct {
-	uint mod;
-	KeySym keysym;
-	void (*func)(const Arg *);
-	const Arg arg;
-} Shortcut;
-
-/* X modifiers */
-#define XK_ANY_MOD    UINT_MAX
-#define XK_NO_MOD     0
-#define XK_SWITCH_MOD (1<<13|1<<14)
-
-/* function definitions used in config.h */
-static void numlock(const Arg *);
-static void zoom(const Arg *);
-static void zoomabs(const Arg *);
-static void zoomreset(const Arg *);
-static void cursor_move_x_relative(const Arg* arg);
-static void cursor_move_y_relative(const Arg* arg);
-static void cursor_move_absolute(const Arg* arg);
-static void save_buffer(const Arg* arg);
-static void toggle_selection(const Arg* arg);
-static void move_cursor_to_offset(const Arg* arg);
-static void move_cursor_to_end_of_buffer(const Arg* arg);
-static void clipboard_copy(const Arg* arg);
-static void clipboard_paste(const Arg* arg);
-static void set_line_dirty(int y);
-static void undo(const Arg* arg);
-static void redo(const Arg* arg);
-
-static void scroll_buffer_when_resize(int x, int y, enum cursor_reason callback_reason);
-static void keep_cursor_col(int x, int y, enum cursor_reason callback_reason);
-static void move_selection(int x, int y, enum cursor_reason callback_reason);
-static void cursor_callback(int x, int y, enum cursor_reason callback_reason);
-
-static void add_to_undo_buffer(Buffer* buffer, int x, int y, enum buffer_content_reason reason);
-static void buffer_content_callback(Buffer* buffer, int x, int y, enum buffer_content_reason reason);
 
 /* config.h for applying patches and the configuration. */
 #include "config.h"
+
+#define Glyph Glyph_
+
+static void keep_cursor_col(struct window_buffer* buf, enum cursor_reason callback_reason);
+static void move_selection(struct window_buffer* buf, enum cursor_reason callback_reason);
+
+static void add_to_undo_buffer(struct file_buffer* buffer, int offset, enum buffer_content_reason reason);
 
 /* XEMBED messages */
 #define XEMBED_FOCUS_IN  4
@@ -151,6 +118,7 @@ static void xunloadfont(Font *);
 static void xunloadfonts(void);
 static void xsetenv(void);
 static void xseturgency(int);
+static void xsettitle(char *);
 
 static void expose(XEvent *);
 static void visibility(XEvent *);
@@ -163,7 +131,7 @@ static void cmessage(XEvent *);
 static void resize(XEvent *);
 static void focus(XEvent *);
 static int  match(uint, uint);
-static void buffer_copy_ub_to_current(Buffer* buffer);
+static void buffer_copy_ub_to_current(struct window_buffer* buffer);
 
 static void run(void);
 
@@ -182,13 +150,21 @@ static void (*handler[LASTEvent])(XEvent *) = {
 };
 
 /* Globals */
+static struct window_split_node root_node = {.mode = WINDOW_SINGULAR};
+static struct window_split_node* focused_node = &root_node;
+
+// cursor is set when calling buffer_write_to_screen and the buffer is focused_window
+struct window_buffer* focused_window = {0};
+int cursor_x, cursor_y;
+
+static struct file_buffer* file_buffers;
+static int available_buffer_slots;
 static DC dc;
 static XWindow xw;
 static Atom xtarget;
 static char* copy_buffer;
 static int copy_len;
 static TermWindow win;
-static Buffer focused_buffer = {0};
 
 /* Font Ring Cache */
 enum {
@@ -226,6 +202,22 @@ numlock(const Arg *dummy)
 	win.mode ^= MODE_NUMLOCK;
 }
 
+void window_split(const Arg *arg)
+{
+	window_buffer_split(focused_node, 0.5, arg->i);
+	focused_node = focused_node->node2;
+	focused_window = &focused_node->window;
+}
+
+void window_move(const Arg *arg)
+{
+	struct window_split_node* new_node = window_switch_to_window(focused_node, arg->i);
+	if (new_node->mode == WINDOW_SINGULAR) {
+		focused_node = new_node;
+		focused_window = &focused_node->window;
+	}
+}
+
 void
 zoom(const Arg *arg)
 {
@@ -241,7 +233,6 @@ zoomabs(const Arg *arg)
 	xunloadfonts();
 	xloadfonts(usedfont, arg->f);
 	cresize(0, 0);
-	redraw();
 	xhints();
 }
 
@@ -259,59 +250,52 @@ zoomreset(const Arg *arg)
 void
 cursor_move_x_relative(const Arg* arg)
 {
-	buffer_move_cursor_relative(&focused_buffer, arg->i, 0,
-						   CURSOR_RIGHT_LEFT_MOVEMENT);
-	buffer_snap_cursor(&focused_buffer, 0);
+	buffer_move_on_line(focused_window, arg->i, CURSOR_RIGHT_LEFT_MOVEMENT);
 }
 
 void
 cursor_move_y_relative(const Arg* arg)
 {
-	int x = (focused_buffer.x_scroll) ?
-		focused_buffer.cursor_col - focused_buffer.x_scroll : focused_buffer.cursor_col;
-	buffer_move_cursor(&focused_buffer, x, term.c.y + arg->i, CURSOR_UP_DOWN_MOVEMENT);
-	buffer_snap_cursor(&focused_buffer, 0);
-}
-
-void cursor_move_absolute(const Arg* arg)
-{
-	buffer_move_cursor(&focused_buffer, arg->vec2i[0], arg->vec2i[1], 1);
+	buffer_move_lines(focused_window, arg->i, 0);
+	buffer_move_to_x(focused_window, focused_window->cursor_col, CURSOR_UP_DOWN_MOVEMENT);
 }
 
 void
 save_buffer(const Arg* arg)
 {
-	buffer_write_to_filepath(&focused_buffer);
+	buffer_write_to_filepath(get_file_buffer(focused_window));
 }
 
 void
 toggle_selection(const Arg* arg)
 {
-	if (focused_buffer.mode & BUFFER_SELECTION_ON) {
-		focused_buffer.mode &= ~(BUFFER_SELECTION_ON);
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (fb->mode & BUFFER_SELECTION_ON) {
+		fb->mode &= ~(BUFFER_SELECTION_ON);
 	} else {
-		focused_buffer.mode |= BUFFER_SELECTION_ON;
-		focused_buffer.s1o = focused_buffer.s2o = buffer_snap_cursor(&focused_buffer, 0);
+		fb->mode |= BUFFER_SELECTION_ON;
+		fb->s1o = fb->s2o = focused_window->cursor_offset;
 	}
 }
 
 void
 move_cursor_to_offset(const Arg* arg)
 {
-	buffer_move_cursor_to_offset(&focused_buffer, arg->i, 0);
+	focused_window->cursor_offset = arg->i;
 }
 
 void
 move_cursor_to_end_of_buffer(const Arg* arg)
 {
-	buffer_move_cursor_to_offset(&focused_buffer, focused_buffer.len, 0);
+	focused_window->cursor_offset = get_file_buffer(focused_window)->len-1;
 }
 
 void
 clipboard_copy(const Arg* arg)
 {
+	struct file_buffer* fb = get_file_buffer(focused_window);
 	int len;
-	char* temp = buffer_get_selection(&focused_buffer, &len);
+	char* temp = buffer_get_selection(fb, &len);
 	if (!temp)
 		return;
 	if (copy_buffer)
@@ -319,8 +303,8 @@ clipboard_copy(const Arg* arg)
 	copy_buffer = temp;
 	copy_len = len;
 
-	buffer_move_cursor_to_selection_start(&focused_buffer);
-	focused_buffer.mode &= ~BUFFER_SELECTION_ON;
+	buffer_move_cursor_to_selection_start(focused_window);
+	fb->mode &= ~BUFFER_SELECTION_ON;
 
 	Atom clipboard;
 	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
@@ -338,45 +322,43 @@ clipboard_paste(const Arg* arg)
 }
 
 void
-buffer_copy_ub_to_current(Buffer* buffer)
+buffer_copy_ub_to_current(struct window_buffer* buffer)
 {
-	assert(buffer);
-	struct undo_buffer* cub = &buffer->ub[buffer->current_undo_buffer];
+	struct file_buffer* fb = get_file_buffer(buffer);
+	struct undo_buffer* cub = &fb->ub[fb->current_undo_buffer];
 	assert(cub->contents);
 
-	buffer->contents = xrealloc(buffer->contents, cub->capacity);
-	memcpy(buffer->contents, cub->contents, cub->capacity);
-	buffer->len = cub->len;
-	buffer->capacity = cub->capacity;
+	fb->contents = xrealloc(fb->contents, cub->capacity);
+	memcpy(fb->contents, cub->contents, cub->capacity);
+	fb->len = cub->len;
+	fb->capacity = cub->capacity;
 
-	term.c.x = cub->cx, term.c.y = cub->cy;
-	buffer->x_scroll = cub->xscroll;
-	buffer->y_scroll = cub->yscroll;
-	buffer_move_cursor_relative(buffer, 0, 0, 1);
+	buffer_move_to_offset(buffer, cub->cursor_offset, CURSOR_SNAPPED);
+	buffer->y_scroll = cub->y_scroll;
 }
 
 void
 undo(const Arg* arg)
 {
-	assert(&focused_buffer);
-	if (focused_buffer.current_undo_buffer == 0)
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (fb->current_undo_buffer == 0)
 		return;
-	focused_buffer.current_undo_buffer--;
-	focused_buffer.available_redo_buffers++;
+	fb->current_undo_buffer--;
+	fb->available_redo_buffers++;
 
-	buffer_copy_ub_to_current(&focused_buffer);
+	buffer_copy_ub_to_current(focused_window);
 }
 
 void
 redo(const Arg* arg)
 {
-	assert(&focused_buffer);
-	if (focused_buffer.available_redo_buffers == 0)
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (fb->available_redo_buffers == 0)
 		return;
-	focused_buffer.available_redo_buffers--;
-	focused_buffer.current_undo_buffer++;
+	fb->available_redo_buffers--;
+	fb->current_undo_buffer++;
 
-	buffer_copy_ub_to_current(&focused_buffer);
+	buffer_copy_ub_to_current(focused_window);
 }
 
 void
@@ -457,17 +439,18 @@ selnotify(XEvent *e)
 			*repl++ = '\n';
 		}
 
-		if (focused_buffer.contents) {
-			if (focused_buffer.mode & BUFFER_SELECTION_ON) {
-				buffer_remove_selection(&focused_buffer);
-				buffer_move_cursor_to_selection_start(&focused_buffer);
-				focused_buffer.mode &= ~(BUFFER_SELECTION_ON);
+		struct file_buffer* fb = get_file_buffer(focused_window);
+		if (fb->contents) {
+			if (fb->mode & BUFFER_SELECTION_ON) {
+				buffer_remove_selection(fb);
+				buffer_move_cursor_to_selection_start(focused_window);
+				fb->mode &= ~(BUFFER_SELECTION_ON);
 			}
-			int offset = buffer_snap_cursor(&focused_buffer, 0);
-			buffer_insert(&focused_buffer, (char*)data, nitems * format / 8, offset, 1);
-			buffer_move_cursor_to_offset(&focused_buffer, offset + (nitems * format / 8), 0);
+			int offset = focused_window->cursor_offset;
+			buffer_insert(fb, (char*)data, nitems * format / 8, offset, 1);
+			buffer_move_to_offset(focused_window, offset + (nitems * format / 8), 0);
 			if (buffer_contents_updated)
-				buffer_contents_updated(&focused_buffer, term.c.x, term.c.y, BUFFER_CONTENT_BIG_CHANGE);
+				buffer_contents_updated(fb, offset, BUFFER_CONTENT_BIG_CHANGE);
 		}
 		XFree(data);
 		/* number of 32-bit chunks returned */
@@ -508,7 +491,6 @@ selrequest(XEvent *e)
 						XA_ATOM, 32, PropModeReplace,
 						(uchar *) &string, 1);
 		xev.property = xsre->property;
-		puts("xa_targets");
 	} else if (xsre->target == xtarget || xsre->target == XA_STRING) {
 		/*
 		 * xith XA_STRING non ascii characters may be incorrect in the
@@ -517,7 +499,7 @@ selrequest(XEvent *e)
 		clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
 		int sel_len;
 		if (xsre->selection == XA_PRIMARY) {
-			seltext = buffer_get_selection(&focused_buffer, &sel_len);
+			seltext = buffer_get_selection(get_file_buffer(focused_window), &sel_len);
 		} else if (xsre->selection == clipboard) {
 			seltext = copy_buffer;
 			sel_len = copy_len;
@@ -528,8 +510,6 @@ selrequest(XEvent *e)
 			return;
 		}
 		if (seltext) {
-			//printf("\"%s\"\n", seltext);
-			puts("seltext");
 			XChangeProperty(xsre->display, xsre->requestor,
 							xsre->property, xsre->target,
 							8, PropModeReplace,
@@ -537,69 +517,50 @@ selrequest(XEvent *e)
 			xev.property = xsre->property;
 			if (seltext != copy_buffer)
 				free(seltext);
-		} else {
-			puts("seltextno");
 		}
 	}
 
-	puts("sending event");
 	/* all done, send a notification to the listener */
 	if (!XSendEvent(xsre->display, xsre->requestor, 1, 0, (XEvent *) &xev))
 		fprintf(stderr, "Error sending SelectionNotify event\n");
 }
 
 void
-keep_cursor_col(int x, int y, enum cursor_reason callback_reason)
+keep_cursor_col(struct window_buffer* buf, enum cursor_reason callback_reason)
 {
 	static int last_cursor_col;
 
 	if (callback_reason == CURSOR_COMMAND_MOVEMENT || callback_reason == CURSOR_RIGHT_LEFT_MOVEMENT) {
-		focused_buffer.cursor_col = x + focused_buffer.x_scroll;
-		last_cursor_col = x;
+		int y;
+		buffer_offset_to_xy(buf, buf->cursor_offset, -1, &buf->cursor_col, &y);
+		last_cursor_col = buf->cursor_col;
 	} else if (callback_reason == CURSOR_WINDOW_RESIZED) {
+		int x, y;
+		buffer_offset_to_xy(buf, buf->cursor_offset, -1, &x, &y);
 		if (last_cursor_col != x)
-			focused_buffer.cursor_col = x + focused_buffer.x_scroll;
+			buf->cursor_col = x;
+	}
+}
+
+void move_selection(struct window_buffer* buf, enum cursor_reason callback_reason)
+{
+	struct file_buffer* fb = get_file_buffer(buf);
+	if (fb->mode & BUFFER_SELECTION_ON) {
+		fb->s2o = buf->cursor_offset;
 	}
 }
 
 void
-scroll_buffer_when_resize(int x, int y, enum cursor_reason callback_reason)
+cursor_callback(struct window_buffer* buf, enum cursor_reason callback_reason)
 {
-	static int lastx, lasty;
+	keep_cursor_col(buf, callback_reason);
+	move_selection(buf, callback_reason);
 
-	if (callback_reason == CURSOR_WINDOW_RESIZED && focused_buffer.contents) {
-		if (lastx < x) lastx = x;
-		buffer_scroll(&focused_buffer, lastx - x, lasty - y);
-	}
-	lastx = x, lasty = y;
-}
-
-void move_selection(int x, int y, enum cursor_reason callback_reason)
-{
-	if (focused_buffer.mode & BUFFER_SELECTION_ON) {
-		focused_buffer.s2o = buffer_snap_cursor(&focused_buffer, 0);
-	}
+	printf("mved to: %d | reason: %d\n", buf->cursor_offset, callback_reason);
 }
 
 void
-cursor_callback(int x, int y, enum cursor_reason callback_reason)
-{
-	keep_cursor_col(x, y, callback_reason);
-	scroll_buffer_when_resize(x, y, callback_reason);
-	move_selection(x, y, callback_reason);
-	set_line_dirty(y);
-
-	printf("%d %d reason %d\n", x, y, callback_reason);
-}
-
-void
-set_line_dirty(int y)
-{
-	term.dirty[y] = 1;
-}
-
-void
-add_to_undo_buffer(Buffer* buffer, int x, int y, enum buffer_content_reason reason)
+add_to_undo_buffer(struct file_buffer* buffer, int offset, enum buffer_content_reason reason)
 {
 	static time_t last_normal_edit;
 	static int edits;
@@ -624,9 +585,9 @@ add_to_undo_buffer(Buffer* buffer, int x, int y, enum buffer_content_reason reas
 		goto copy_undo_buffer;
 	}
 
-	if (buffer->current_undo_buffer == buffer->undo_buffer_len-1) {
+	if (buffer->current_undo_buffer == UNDO_BUFFERS_COUNT-1) {
 		char* begin_buffer = buffer->ub[0].contents;
-		memmove(buffer->ub, &(buffer->ub[1]), (buffer->undo_buffer_len-1) * sizeof(struct undo_buffer));
+		memmove(buffer->ub, &(buffer->ub[1]), (UNDO_BUFFERS_COUNT-1) * sizeof(struct undo_buffer));
 		buffer->ub[buffer->current_undo_buffer].contents = begin_buffer;
 	} else {
 		buffer->current_undo_buffer++;
@@ -639,16 +600,47 @@ copy_undo_buffer: ;
 	memcpy(cub->contents, buffer->contents, buffer->capacity);
 	cub->len = buffer->len;
 	cub->capacity = buffer->capacity;
-	cub->cx = x, cub->cy = y;
-	cub->xscroll = buffer->x_scroll;
-	cub->yscroll = buffer->y_scroll;
+	cub->cursor_offset = offset;
+	if (focused_window)
+		cub->y_scroll = focused_window->y_scroll;
+	else
+		cub->y_scroll = 0;
 }
 
 void
-buffer_content_callback(Buffer* buffer, int x, int y, enum buffer_content_reason reason)
+buffer_content_callback(struct file_buffer* buffer, int offset, enum buffer_content_reason reason)
 {
-	set_line_dirty(y);
-	add_to_undo_buffer(buffer, x, y, reason);
+	add_to_undo_buffer(buffer, offset, reason);
+}
+
+struct file_buffer*
+get_file_buffer(struct window_buffer* buf)
+{
+	assert(file_buffers);
+
+	if (buf->buffer_index < 0)
+		buf->buffer_index = available_buffer_slots-1;
+	else if (buf->buffer_index >= available_buffer_slots)
+		buf->buffer_index = 0;
+
+	return (file_buffers[buf->buffer_index].contents) ? &(file_buffers[buf->buffer_index]) : NULL;
+}
+
+int
+new_file_buffer(struct file_buffer buf)
+{
+	assert(buf.contents);
+	for(int n = 0; n < available_buffer_slots; n++) {
+		if (!file_buffers[n].contents) {
+			file_buffers[n] = buf;
+			return n;
+		}
+	}
+
+	available_buffer_slots++;
+	file_buffers = xrealloc(file_buffers, sizeof(struct file_buffer) * available_buffer_slots);
+	file_buffers[available_buffer_slots-1] = buf;
+	return available_buffer_slots-1;
 }
 
 void
@@ -764,7 +756,7 @@ xsetcolorname(int x, const char *name)
 void
 xclear(int x1, int y1, int x2, int y2)
 {
-	XftDrawRect(xw.draw, &dc.col[defaultbg],
+	XftDrawRect(xw.draw, &dc.col[default_attributes.bg],
 				x1, y1, x2-x1, y2-y1);
 }
 
@@ -1072,8 +1064,8 @@ xinit(int cols, int rows)
 		xw.t += DisplayHeight(xw.dpy, xw.scr) - win.h - 2;
 
 	/* Events */
-	xw.attrs.background_pixel = dc.col[defaultbg].pixel;
-	xw.attrs.border_pixel = dc.col[defaultbg].pixel;
+	xw.attrs.background_pixel = dc.col[default_attributes.bg].pixel;
+	xw.attrs.border_pixel = dc.col[default_attributes.bg].pixel;
 	xw.attrs.bit_gravity = NorthWestGravity;
 	xw.attrs.event_mask = FocusChangeMask | KeyPressMask | KeyReleaseMask
 		| ExposureMask | VisibilityChangeMask | StructureNotifyMask
@@ -1093,7 +1085,7 @@ xinit(int cols, int rows)
 					  &gcvalues);
 	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
 						   DefaultDepth(xw.dpy, xw.scr));
-	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
+	XSetForeground(xw.dpy, dc.gc, dc.col[default_attributes.bg].pixel);
 	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
 
 	/* font spec buffer */
@@ -1137,7 +1129,7 @@ xinit(int cols, int rows)
 					PropModeReplace, (uchar *)&thispid, 1);
 
 	win.mode = MODE_NUMLOCK;
-	resettitle();
+	xsettitle(NULL);
 	xhints();
 	XMapWindow(xw.dpy, xw.win);
 	XSync(xw.dpy, False);
@@ -1408,7 +1400,7 @@ xdrawcursor(int cx, int cy, Glyph g)
 	 */
 	g.mode &= ATTR_BOLD|ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE;
 
-	g.fg = defaultbg;
+	g.fg = default_attributes.bg;
 	g.bg = defaultcs;
 	drawcol = dc.col[g.bg];
 
@@ -1536,14 +1528,10 @@ xfinishdraw(void)
 {
 	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w,
 			  win.h, 0, 0);
-	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
+	XSetForeground(xw.dpy, dc.gc, dc.col[default_attributes.bg].pixel);
 }
 
-void
-expose(XEvent *ev)
-{
-	redraw();
-}
+void expose(XEvent *ev) {} // do nothing
 
 void
 visibility(XEvent *ev)
@@ -1638,76 +1626,76 @@ kpress(XEvent *ev)
 	}
 
 	/* 2. defaults for actions like backspace, del, enter etc*/
-	int offset = buffer_snap_cursor(&focused_buffer, 0);
+	int offset = focused_window->cursor_offset;
+	struct file_buffer* fb = get_file_buffer(focused_window);
 
 	if (offset == -1)
 		return;
 
 	switch (ksym) {
 	case XK_BackSpace:
-		if (focused_buffer.mode & BUFFER_SELECTION_ON) {
-			buffer_remove_selection(&focused_buffer);
-			buffer_move_cursor_to_selection_start(&focused_buffer);
-			focused_buffer.mode &= ~(BUFFER_SELECTION_ON);
-			buffer_snap_cursor(&focused_buffer, 0);
+		if (fb->mode & BUFFER_SELECTION_ON) {
+			buffer_remove_selection(fb);
+			buffer_move_cursor_to_selection_start(focused_window);
+			fb->mode &= ~(BUFFER_SELECTION_ON);
 			return;
 		}
 		if (offset <= 0) return;
-		offset--;
 
-		if (term.c.x == 0)
-			buffer_move_cursor(&focused_buffer, INT32_MAX/2, term.c.y-1, 1);
-		else
-			buffer_move_cursor_relative(&focused_buffer, -1, 0, 1);
-
-		buffer_snap_cursor(&focused_buffer, 0);
+		if (fb->contents[offset-1] == '\n') {
+			buffer_move_lines(focused_window, -1, CURSOR_COMMAND_MOVEMENT);
+		} else {
+			buffer_move_on_line(focused_window, -1, CURSOR_COMMAND_MOVEMENT);
+		}
+		offset = focused_window->cursor_offset;
 
 		/* FALLTHROUGH */
 	case XK_Delete:
-		if (focused_buffer.mode & BUFFER_SELECTION_ON) {
-			buffer_remove_selection(&focused_buffer);
-			buffer_move_cursor_to_selection_start(&focused_buffer);
-			focused_buffer.mode &= ~(BUFFER_SELECTION_ON);
-			buffer_snap_cursor(&focused_buffer, 0);
+		if (fb->mode & BUFFER_SELECTION_ON) {
+			buffer_remove_selection(fb);
+			buffer_move_cursor_to_selection_start(focused_window);
+			fb->mode &= ~(BUFFER_SELECTION_ON);
 			return;
 		}
-		buffer_remove(&focused_buffer, offset, 1, 0, 0);
+		buffer_remove(fb, offset, 1, 0, 0);
 		return;
 	case XK_Return:
-		if (focused_buffer.mode & BUFFER_SELECTION_ON) {
-			buffer_remove_selection(&focused_buffer);
-			buffer_move_cursor_to_selection_start(&focused_buffer);
-			focused_buffer.mode &= ~(BUFFER_SELECTION_ON);
-			offset = buffer_snap_cursor(&focused_buffer, 0);
+		if (fb->mode & BUFFER_SELECTION_ON) {
+			buffer_remove_selection(fb);
+			buffer_move_cursor_to_selection_start(focused_window);
+			fb->mode &= ~(BUFFER_SELECTION_ON);
+			offset = focused_window->cursor_offset;
 		}
-		buffer_insert(&focused_buffer, "\n", 1, offset, 0);
-		buffer_move_cursor_relative(&focused_buffer, -term.col, 1, 1);
+		buffer_insert(fb, "\n", 1, offset, 0);
+		buffer_move_to_offset(focused_window, offset+1, CURSOR_COMMAND_MOVEMENT);
 		return;
-	case XK_Home:
-		buffer_move_cursor(&focused_buffer, -focused_buffer.x_scroll-1, term.c.y, 1);
+	case XK_Home: {
+		int new_offset = buffer_seek_char_backwards(fb, offset, '\n');
+		if (new_offset < 0)
+			new_offset = 0;
+		buffer_move_to_offset(focused_window, new_offset, CURSOR_COMMAND_MOVEMENT);
 		return;
-	case XK_End:
-		buffer_move_cursor_to_offset(&focused_buffer,
-			(char*)memchr(&(focused_buffer.contents[offset]), '\n', focused_buffer.len - offset)
-			- focused_buffer.contents, 0);
-		buffer_move_cursor_relative(&focused_buffer, 0, 0, CURSOR_COMMAND_MOVEMENT);
+	}
+	case XK_End: {
+		int new_offset = buffer_seek_char(fb, offset, '\n');
+		if (new_offset < 0)
+			new_offset = fb->len-1;
+		buffer_move_to_offset(focused_window, new_offset, CURSOR_COMMAND_MOVEMENT);
 		return;
+	}
 	case XK_Page_Down:
-		buffer_scroll(&focused_buffer, 0, (term.row-1) / 2);
-		buffer_move_cursor(&focused_buffer, term.c.x, term.c.x, 1);
-		buffer_snap_cursor(&focused_buffer, 0);
+		buffer_move_lines(focused_window, (term.row-1) / 2, CURSOR_COMMAND_MOVEMENT);
+		focused_window->y_scroll += (term.row-1) / 2;
+		//TODO: make cursor follow
 		return;
 	case XK_Page_Up:
-		buffer_scroll(&focused_buffer, 0, -((term.row-1) / 2));
-		buffer_move_cursor(&focused_buffer, term.c.x, term.c.x, 1);
-		buffer_snap_cursor(&focused_buffer, 0);
+		buffer_move_lines(focused_window, -((term.row-1) / 2), CURSOR_COMMAND_MOVEMENT);
+		focused_window->y_scroll -= (term.row-1) / 2;
+		//TODO: make cursor follow
 		return;
 	case XK_Tab:
-		buffer_insert(&focused_buffer, "\t", 1, offset, 0);
-		buffer_move_cursor_relative(&focused_buffer, 1, 0, 1);
-		break;
-	case XK_F1:
-		printf("%d\n", offset);
+		buffer_insert(fb, "\t", 1, offset, 0);
+		buffer_move_on_line(focused_window, 1, CURSOR_COMMAND_MOVEMENT);
 		return;
 	}
 	//TODO: keybinds for escape and tab
@@ -1724,13 +1712,13 @@ kpress(XEvent *ev)
 
 	// TODO: allow blocking of the bufferwrite, redirecting to keybinds with multiple characther length
 	if (buf[0] >= 32) {
-		if (focused_buffer.mode & BUFFER_SELECTION_ON) {
-			buffer_remove_selection(&focused_buffer);
-			buffer_move_cursor_to_selection_start(&focused_buffer);
-			focused_buffer.mode &= ~(BUFFER_SELECTION_ON);
+		if (fb->mode & BUFFER_SELECTION_ON) {
+			buffer_remove_selection(fb);
+			buffer_move_cursor_to_selection_start(focused_window);
+			fb->mode &= ~(BUFFER_SELECTION_ON);
 		}
-		buffer_insert(&focused_buffer, buf, len, offset, 0);
-		buffer_move_cursor_relative(&focused_buffer, 1, 0, 1);
+		buffer_insert(fb, buf, len, offset, 0);
+		buffer_move_on_line(focused_window, 1, CURSOR_COMMAND_MOVEMENT);
 	} else {
 		printf("unhandled control character %x\n", buf[0]);
 	}
@@ -1795,20 +1783,22 @@ run(void)
 			XNextEvent(xw.dpy, &ev);
 			if (XFilterEvent(&ev, None))
 				continue;
-			if (handler[ev.type])
+			if (handler[ev.type]) {
 				(handler[ev.type])(&ev);
-			xev = 1;
+				xev = 1;
+			}
 		}
 
-		if (!tisdirty() && !xev) {
+		if (!xev) {
 			nanosleep(&(struct timespec){.tv_nsec = 1e6}, NULL);
 			continue;
 		}
 
-		buffer_write_to_screen(&focused_buffer);
-		buffer_write_selection(&focused_buffer);
 
-		draw();
+		tsetregion(0, 0, term.col-1, term.row-1, ' ');
+		window_write_tree_to_screen(&root_node, 0, 0, term.col-1, term.row-1);
+
+		draw(cursor_x,cursor_y);
 		XFlush(xw.dpy);
 	}
 }
@@ -1833,7 +1823,17 @@ main(int argc, char *argv[])
 	tnew(cols, rows);
 	xinit(cols, rows);
 	xsetenv();
-	buffer_new(&focused_buffer, "./x.c");
+
+	//buffer_new("/home/halvard/gunslinger/gs.h");
+	//buffer_new("/home/halvard/test.c");
+
+	root_node.mode = WINDOW_SINGULAR;
+	root_node.window.buffer_index =
+		new_file_buffer(buffer_new("/home/halvard/gunslinger/gs.h"));
+		//new_file_buffer(buffer_new("/home/halvard/Code/C/se/st/st.c"));
+		//new_file_buffer(buffer_new("/home/halvard/test.c"));
+	focused_node = &root_node;
+	focused_window = &focused_node->window;
 	run();
 
 	return 0;
