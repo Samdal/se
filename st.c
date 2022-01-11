@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <assert.h>
+#include <stddef.h>
 
 #include "st.h"
 #include "win.h"
@@ -13,20 +14,11 @@
 #define UTF_INVALID   0xFFFD
 #define UTF_SIZ       4
 
-/* macros */
-#define IS_SET(flag)		((term.mode & (flag)) != 0)
-
 Term term;
-static void tclearregion(int, int, int, int);
-static void treset(void);
-static void tsetdirt(int, int);
-static void tswapscreen(void);
-static void tfulldirt(void);
-
-static void drawregion(int, int, int, int);
+extern struct window_buffer* focused_window;
+extern int cursor_x, cursor_y;
 
 static void colour_selection(Glyph* letter);
-static void set_selection_start_end(int* x1, int* x2, int* y1, int* y2, Buffer* buffer);
 
 static int t_decode_utf8_buffer(const char* buffer, const int buflen, Rune* u);
 
@@ -151,185 +143,341 @@ tattrset(int attr)
 }
 
 void
-tsetdirt(int top, int bot)
+tnew(int col, int row)
 {
-	int i;
-
-	LIMIT(top, 0, term.row-1);
-	LIMIT(bot, 0, term.row-1);
-
-	for (i = top; i <= bot; i++)
-		term.dirty[i] = 1;
+	term = (Term){0};
+	tresize(col, row);
+	tsetregion(0, 0, term.col-1, term.row-1, ' ');
 }
 
 int
-tisdirty()
+buffer_seek_char(const struct file_buffer* buf, int offset, char byte)
 {
-	for (int i = 0; i < term.row-1; i++)
-		if (term.dirty[i])
-			return 1;
+	LIMIT(offset, 0, buf->len-1);
+	char* new_buf = memchr(buf->contents + offset, byte, buf->len - offset);
+	if (!new_buf) return -1;
+	return new_buf - buf->contents;
+}
+int
+buffer_seek_char_backwards(const struct file_buffer* buf, int offset, char byte)
+{
+	LIMIT(offset, 0, buf->len-1);
+	for (int n = offset-1; n >= 0; n--) {
+		if (buf->contents[n] == byte) {
+			return n+1;
+		}
+	}
+	return -1;
+}
+
+int
+buffer_seek_string(const struct file_buffer* buf, int offset, const char* string)
+{
+	LIMIT(offset, 0, buf->len-1);
+	int str_len = strlen(string);
+
+	for (int n = offset; n < buf->len - str_len; n++) {
+		if (!memcmp(buf->contents + n, string, str_len)) {
+			printf("n = %d\n", n);
+			return n;
+		}
+	}
+	return -1;
+}
+int
+buffer_seek_string_backwards(const struct file_buffer* buf, int offset, const char* string)
+{
+	int str_len = strlen(string);
+	offset += str_len;
+	LIMIT(offset, 0, buf->len-1);
+
+	for (int n = offset - str_len; n >= 0; n--) {
+		if (!memcmp(buf->contents + n, string, str_len)) {
+			printf("n = %d\n", n);
+			return n;
+		}
+	}
+	return -1;
+}
+
+void
+buffer_move_on_line(struct window_buffer* buf, int amount, enum cursor_reason callback_reason)
+{
+	const struct file_buffer* fb = get_file_buffer((buf));
+
+	if (amount < 0) {
+		/*
+		 * we cant get the size of a utf8 char backwards
+		 * therefore we move all the way to the start of the line,
+		 * then a seeker will try to find the cursor pos
+		 * the follower will then be *amount* steps behind,
+		 * when the seeker reaches the cursor
+		 * the follower will be the new cursor position
+		 */
+
+		int line_start = buffer_seek_char_backwards(fb, buf->cursor_offset, '\n');
+		amount = abs(MAX(line_start - buf->cursor_offset, amount));
+		assert(amount < 2048);
+
+		char moves[amount];
+		int seek_pos = line_start, follower_pos = line_start;
+		int n = 0;
+		while (seek_pos < buf->cursor_offset) {
+			Rune u;
+			int charsize = t_decode_utf8_buffer(fb->contents + seek_pos, fb->len - seek_pos, &u);
+			seek_pos += charsize;
+			if (n < amount) {
+				moves[n++] = charsize;
+			} else {
+				follower_pos += moves[0];
+				memmove(moves, moves + 1, amount - 1);
+				moves[amount - 1] = charsize;
+			}
+		}
+		buf->cursor_offset = follower_pos;
+
+		LIMIT(buf->cursor_offset, 0, fb->len-1);
+	} else if (amount > 0) {
+		for (int charsize = 0;
+			 buf->cursor_offset < fb->len && amount > 0 && fb->contents[buf->cursor_offset + charsize] != '\n';
+			 buf->cursor_offset += charsize, amount--) {
+			Rune u;
+			charsize = t_decode_utf8_buffer(fb->contents + buf->cursor_offset, fb->len - buf->cursor_offset, &u);
+			if (u != '\n' && u != '\t')
+				if (wcwidth(u) <= 0)
+					amount++;
+			if (buf->cursor_offset + charsize >= fb->len)
+				break;
+		}
+	}
+
+	if (callback_reason && cursor_movement_callback)
+		cursor_movement_callback(buf, callback_reason);
+}
+
+void
+buffer_move_lines(struct window_buffer* buf, int amount, enum cursor_reason callback_reason)
+{
+	const struct file_buffer* fb = get_file_buffer((buf));
+	int offset = buf->cursor_offset;
+	if (amount > 0) {
+		while (amount-- && offset >= 0)
+			offset = buffer_seek_char(fb, offset, '\n')+1;
+		if (offset < 0)
+			offset = fb->len-1;
+	} else if (amount < 0) {
+		while (amount++ && offset >= 0)
+			offset = buffer_seek_char_backwards(fb, offset, '\n')-1;
+	}
+	buffer_move_to_offset(buf, offset, callback_reason);
+}
+
+void
+buffer_move_to_offset(struct window_buffer* buf, int offset, enum cursor_reason callback_reason)
+{
+	const struct file_buffer* fb = get_file_buffer((buf));
+	LIMIT(offset, 0, fb->len-1);
+	buf->cursor_offset = offset;
+
+	if (callback_reason && cursor_movement_callback)
+		cursor_movement_callback(buf, callback_reason);
+}
+
+void
+buffer_move_to_x(struct window_buffer* buf, int x, enum cursor_reason callback_reason)
+{
+	assert(buf);
+	struct file_buffer* fb = get_file_buffer(buf);
+
+	int offset = buffer_seek_char_backwards(fb, buf->cursor_offset, '\n');
+	if (offset < 0)
+		offset = 0;
+	buffer_move_to_offset(buf, offset, 0);
+
+	int x_counter = 0;
+
+	while (offset < fb->len) {
+		if (fb->contents[offset] == '\t') {
+			offset++;
+			if (x_counter <= 0) x_counter += 1;
+			while (x_counter % tabspaces != 0) x_counter += 1;
+			x_counter += 1;
+			continue;
+		} else if (fb->contents[offset] == '\n') {
+			break;
+		}
+		Rune u = 0;
+		int charsize = t_decode_utf8_buffer(fb->contents + offset, fb->len - offset, &u);
+		x_counter += wcwidth(u);
+		if (x_counter <= x) {
+			offset += charsize;
+			if (x_counter == x)
+				break;
+		} else {
+			break;
+		}
+	}
+	buffer_move_to_offset(buf, offset, callback_reason);
+}
+
+void
+window_buffer_split(struct window_split_node* parent, float ratio, enum window_split_mode mode)
+{
+	assert(parent);
+	assert(parent->mode == WINDOW_SINGULAR);
+	assert(mode != WINDOW_SINGULAR);
+
+	parent->node1 = xmalloc(sizeof(struct window_split_node));
+	parent->node2 = xmalloc(sizeof(struct window_split_node));
+
+	*parent->node1 = *parent;
+	*parent->node2 = *parent;
+	parent->node1->parent = parent;
+	parent->node2->parent = parent;
+
+	// set the new childrens children to NULL for good measure
+	parent->node1->node1 = NULL;
+	parent->node1->node2 = NULL;
+	parent->node2->node1 = NULL;
+	parent->node2->node2 = NULL;
+
+	parent->mode = mode;
+	parent->ratio = ratio;
+	parent->window = (struct window_buffer){0};
+}
+
+void
+window_write_tree_to_screen(struct window_split_node* root, int minx, int miny, int maxx, int maxy)
+{
+	assert(root);
+
+	if (root->mode == WINDOW_SINGULAR) {
+		buffer_write_to_screen(&root->window, minx, miny, maxx, maxy);
+	} else if (IS_HORISONTAL(root->mode)) {
+		int middlex = ((float)(maxx - minx) * root->ratio) + minx;
+
+		// print seperator
+		tsetregion(middlex+1, miny, middlex+1, maxy, L'│');
+
+		window_write_tree_to_screen(root->node1, minx, miny, middlex, maxy);
+		window_write_tree_to_screen(root->node2, middlex+2, miny, maxx, maxy);
+
+		// print connecting borders
+		if (middlex+1 >= term.col)
+			return;
+		if (miny-1 >= 0 && miny-1 < term.row) {
+			if (term.line[miny-1][middlex+1].u == L'┬' ||
+				term.line[miny-1][middlex+1].u == L'┴' ||
+				term.line[miny-1][middlex+1].u == L'├' ||
+				term.line[miny-1][middlex+1].u == L'┤')
+				tsetchar(L'┼', middlex+1, miny-1);
+			if (term.line[miny-1][middlex+1].u == L'─')
+				tsetchar(L'┬', middlex+1, miny-1);
+		}
+		if (maxy+1 >= 0 && maxy+1 < term.row) {
+			if (term.line[maxy+1][middlex+1].u == L'┬' ||
+				term.line[maxy+1][middlex+1].u == L'┴' ||
+				term.line[maxy+1][middlex+1].u == L'├' ||
+				term.line[maxy+1][middlex+1].u == L'┤')
+				tsetchar(L'┼', middlex+1, maxy+1);
+			if (term.line[maxy+1][middlex+1].u == L'─')
+				tsetchar(L'┴', middlex+1, maxy+1);
+		}
+	} else if (root->mode == WINDOW_VERTICAL) {
+		int middley = ((float)(maxy - miny) * root->ratio) + miny;
+
+		// print seperator
+		tsetregion(minx, middley+1, maxx, middley+1, L'─');
+
+		window_write_tree_to_screen(root->node1, minx, miny, maxx, middley);
+		window_write_tree_to_screen(root->node2, minx, middley+2, maxx, maxy);
+
+		// print connecting borders
+		if (middley+1 >= term.row)
+			return;
+		if (minx-1 >= 0 && minx-1 < term.col) {
+			if (term.line[middley+1][minx-1].u == L'┬' ||
+				term.line[middley+1][minx-1].u == L'┴' ||
+				term.line[middley+1][minx-1].u == L'├' ||
+				term.line[middley+1][minx-1].u == L'┤')
+				tsetchar(L'┼', minx-1, middley+1);
+			if (term.line[middley+1][minx-1].u == L'│')
+				tsetchar(L'├', minx-1, middley+1);
+		}
+		if (maxx+1 >= 0 && maxx+1 < term.col) {
+			if (term.line[middley+1][maxx+1].u == L'┤')
+			if (term.line[middley+1][maxx+1].u == L'┬' ||
+				term.line[middley+1][maxx+1].u == L'┴' ||
+				term.line[middley+1][maxx+1].u == L'├' ||
+				term.line[middley+1][maxx+1].u == L'┤')
+				tsetchar(L'┼', maxx+1, middley+1);
+			if (term.line[middley+1][maxx+1].u == L'│')
+				tsetchar(L'┤', maxx+1, middley+1);
+		}
+	}
+}
+
+int
+is_correct_mode(enum window_split_mode mode, enum move_directons move)
+{
+	if (move == MOVE_RIGHT || move == MOVE_LEFT)
+		return IS_HORISONTAL(mode);
+	if (move == MOVE_UP || move == MOVE_DOWN)
+		return (mode == WINDOW_VERTICAL);
 	return 0;
 }
 
-void
-tsetdirtattr(int attr)
+struct window_split_node*
+window_switch_to_window(struct window_split_node* current, enum move_directons move)
 {
-	int i, j;
+	assert(current);
+	if (!current->parent) return current;
+	assert(current->mode == WINDOW_SINGULAR);
+	struct window_split_node* old_current = current;
 
-	for (i = 0; i < term.row-1; i++) {
-		for (j = 0; j < term.col-1; j++) {
-			if (term.line[i][j].mode & attr) {
-				tsetdirt(i, i);
-				break;
+	if (move == MOVE_RIGHT || move == MOVE_DOWN) {
+		// traverse up the tree to the right
+		for (; current->parent; current = current->parent) {
+			if (is_correct_mode(current->parent->mode, move) && current->parent->node1 == current) {
+				// traverse down until a screen is found
+				current = current->parent->node2;
+				while(current->mode != WINDOW_SINGULAR)
+					current = current->node1;
+
+				return current;
+			}
+		}
+	} else if (move == MOVE_LEFT || move == MOVE_UP) {
+		// traverse up the tree to the left
+		for (; current->parent; current = current->parent) {
+			if (is_correct_mode(current->parent->mode, move) && current->parent->node2 == current) {
+				// traverse down until a screen is found
+				current = current->parent->node1;
+				while(current->mode != WINDOW_SINGULAR)
+					current = current->node2;
+
+				return current;
 			}
 		}
 	}
+
+	return old_current;
 }
 
-void
-tfulldirt(void)
+struct file_buffer
+buffer_new(char* file_path)
 {
-	tsetdirt(0, term.row-1);
-}
-
-void
-treset(void)
-{
-	uint i;
-
-	term.c = (TCursor){{
-		.mode = ATTR_NULL,
-		.fg = defaultfg,
-		.bg = defaultbg
-	}, .x = 0, .y = 0};
-
-	memset(term.tabs, 0, term.col * sizeof(*term.tabs));
-	for (i = tabspaces; i < term.col; i += tabspaces)
-		term.tabs[i] = 1;
-	term.mode = default_mode;
-
-	for (i = 0; i < 2; i++) {
-		tclearregion(0, 0, term.col-1, term.row-1);
-		tswapscreen();
-	}
-}
-
-void
-tnew(int col, int row)
-{
-	term = (Term){ .c = { .attr = { .fg = defaultfg, .bg = defaultbg } } };
-	tresize(col, row);
-	treset();
-}
-
-void
-tswapscreen(void)
-{
-	Line *tmp = term.line;
-
-	term.line = term.alt;
-	term.alt = tmp;
-	term.mode ^= MODE_ALTSCREEN;
-	tfulldirt();
-}
-
-void
-buffer_scroll(Buffer* buffer, int xscroll, int yscroll)
-{
-	if (yscroll) {
-		buffer->y_scroll += yscroll;
-		// prevent you from scrolling outside of the screen
-		if (buffer->y_scroll < 0)
-			buffer->y_scroll = 0;
-		else
-			buffer_snap_cursor(buffer, 0);
-	}
-
-	if (xscroll) {
-		buffer->x_scroll += xscroll;
-		if (buffer->x_scroll < 0)
-			buffer->x_scroll = 0;
-	}
-
-	while(buffer->x_scroll > 0 && term.c.x+1 < term.col) {
-		term.c.x++;
-		buffer->x_scroll--;
-	}
-}
-
-void
-buffer_move_cursor(Buffer* buffer, int x, int y, enum cursor_reason callback_reason)
-{
-	term.c.y = (y <= 0) ? 0 : (y >= term.row) ? term.row-1 : y;
-	int ydiff = y - term.c.y;
-
-	term.c.x = (x <= 0) ? 0 : (x >= term.col-1) ? term.col-1 : x;
-	if (term.c.x > 0 && term.line[term.c.y][term.c.x].mode & ATTR_WDUMMY)
-		term.c.x--;
-
-	int xdiff = x - term.c.x;
-
-	if (callback_reason) {
-		buffer_scroll(buffer, xdiff, ydiff);
-		if (cursor_movement_callback && callback_reason != CURSOR_SCROLL_ONLY) {
-			cursor_movement_callback(term.c.x, term.c.y, callback_reason);
-		}
-	}
-}
-
-void
-buffer_move_cursor_relative(Buffer* buffer, int x, int y, enum cursor_reason callback_reason)
-{
-	int xmoves = x;
-	x = term.c.x;
-	y += term.c.y;
-
-	int y_prev = term.c.y, x_prev = term.c.x;
-
-	if (xmoves > 0) {
-		buffer_move_cursor(buffer, term.c.x, y, 0);
-		char* repl = &(buffer->contents[buffer_snap_cursor(buffer, 1)]);
-		char* last = &(buffer->contents[buffer->len]);
-		for (int charsize;
-			 repl < last && xmoves && *repl != '\n';
-			 repl += charsize, xmoves--) {
-			Rune u;
-			charsize = t_decode_utf8_buffer(repl, last - repl, &u);
-
-			if (*repl == '\t') {
-				if (x == 0)
-					x++;
-				while (x % tabspaces != 0)
-					x++;
-				x++;
-			} else {
-				x += wcwidth(u);
-			}
-		}
-	} else if (xmoves < 0) {
-		while(xmoves++ < 0 && term.c.x > 0)
-			buffer_move_cursor(buffer, term.c.x-1, term.c.y, 0);
-		x = term.c.x;
-	}
-
-	buffer_move_cursor(buffer, x_prev, y_prev, 0);
-	buffer_move_cursor(buffer, x, y, callback_reason);
-}
-
-int
-buffer_new(Buffer* buffer, char* file_path)
-{
-	assert(buffer);
 	if (!file_path) {
 		die("creating new buffers not implemented\n");
 	}
-	memset(buffer, 0, sizeof(Buffer));
-	buffer->file_path = file_path;
+	struct file_buffer buffer = {0};
+	buffer.file_path = file_path;
 
 	FILE *file = fopen(file_path, "rb");
 	if (!file) {
 		fprintf(stderr, "---error reading file \"%s\"---\n", file_path);
-		return -1;
+		die("");
+		return buffer;
 	}
 
 	fseek(file, 0L, SEEK_END);
@@ -343,162 +491,263 @@ buffer_new(Buffer* buffer, char* file_path)
 		die("you are opening a huge file(>10MiB), not allowed");
 	}
 
-	buffer->len = readsize;
-	buffer->capacity = readsize + 100;
+	buffer.len = readsize;
+	buffer.capacity = readsize + 100;
 
-	buffer->contents = xmalloc(buffer->capacity);
+	buffer.contents = xmalloc(buffer.capacity);
 
-	fread(buffer->contents, 1, readsize, file);
+	char bom[4] = {0};
+	fread(bom, 1, 3, file);
+	if (strcmp(bom, "\xEF\xBB\xBF"))
+		rewind(file);
+	else
+		buffer.mode |= BUFFER_UTF8_SIGNED;
+	fread(buffer.contents, 1, readsize, file);
 	fclose(file);
 
-	buffer->undo_buffer_len = undo_buffers;
-	buffer->ub = xmalloc(sizeof(struct undo_buffer) * undo_buffers);
-	memset(buffer->ub, 0, sizeof(struct undo_buffer) * undo_buffers);
-	buffer->available_redo_buffers = 0;
-	buffer->current_undo_buffer = 0;
+	buffer.ub = xmalloc(sizeof(struct undo_buffer) * UNDO_BUFFERS_COUNT);
+	memset(buffer.ub, 0, sizeof(struct undo_buffer) * UNDO_BUFFERS_COUNT);
 
 	if (buffer_contents_updated)
-		buffer_contents_updated(buffer, term.c.x, term.c.y, BUFFER_CONTENT_INIT);
+		buffer_contents_updated(&buffer, 0, BUFFER_CONTENT_INIT);
 
-	return buffer->len;
+	return buffer;
 }
 
 void
-buffer_insert(Buffer* buffer, const char* new_content, const int len, const int offset, int do_not_callback)
+buffer_insert(struct file_buffer* buf, const char* new_content, const int len, const int offset, int do_not_callback)
 {
-	assert(buffer->contents);
-	if (offset > buffer->len)
-		die("writing past buffer %s\n", buffer->file_path);
+	assert(buf->contents);
+	if (offset > buf->len)
+		die("writing past buf %s\n", buf->file_path);
 
-	if (buffer->len + len >= buffer->capacity) {
-		buffer->capacity = buffer->len + len + 256;
-		buffer->contents = xrealloc(buffer->contents, buffer->capacity);
+	if (buf->len + len >= buf->capacity) {
+		buf->capacity = buf->len + len + 256;
+		buf->contents = xrealloc(buf->contents, buf->capacity);
 	}
-	if (offset < buffer->len)
-		memmove(buffer->contents+offset+len, buffer->contents+offset, buffer->len-offset);
-	buffer->len += len;
+	if (offset < buf->len)
+		memmove(buf->contents+offset+len, buf->contents+offset, buf->len-offset);
+	buf->len += len;
 
-	memcpy(buffer->contents+offset, new_content, len);
+	memcpy(buf->contents+offset, new_content, len);
 	if (buffer_contents_updated && !do_not_callback)
-		buffer_contents_updated(buffer, term.c.x, term.c.y, BUFFER_CONTENT_NORMAL_EDIT);
+		buffer_contents_updated(buf, offset, BUFFER_CONTENT_NORMAL_EDIT);
 }
 
 void
-buffer_change(Buffer* buffer, const char* new_content, const int len, const int offset, int do_not_callback)
+buffer_change(struct file_buffer* buf, const char* new_content, const int len, const int offset, int do_not_callback)
 {
-	assert(buffer->contents);
-	if (offset > buffer->len)
-		die("writing past buffer %s\n", buffer->file_path);
+	assert(buf->contents);
+	if (offset > buf->len)
+		die("writing past buf %s\n", buf->file_path);
 
-	if (offset + len > buffer->len) {
-		buffer->len = offset + len;
-		if (buffer->len >= buffer->capacity) {
-			buffer->capacity = buffer->len + len + 256;
-			buffer->contents = xrealloc(buffer->contents, buffer->capacity);
+	if (offset + len > buf->len) {
+		buf->len = offset + len;
+		if (buf->len >= buf->capacity) {
+			buf->capacity = buf->len + len + 256;
+			buf->contents = xrealloc(buf->contents, buf->capacity);
 		}
 	}
 
-	memcpy(buffer->contents+offset, new_content, len);
+	memcpy(buf->contents+offset, new_content, len);
 	if (buffer_contents_updated && !do_not_callback)
-		buffer_contents_updated(buffer, term.c.x, term.c.y, BUFFER_CONTENT_NORMAL_EDIT);
+		buffer_contents_updated(buf, offset, BUFFER_CONTENT_NORMAL_EDIT);
 }
 
 void
-buffer_remove(Buffer* buffer, const int offset, int len, int do_not_calculate_charsize, int do_not_callback)
+buffer_remove(struct file_buffer* buf, const int offset, int len, int do_not_calculate_charsize, int do_not_callback)
 {
-	assert(buffer->contents);
-	if (offset > buffer->len)
-		die("deleting past buffer %s\n", buffer->file_path);
+	assert(buf->contents);
+	if (offset > buf->len)
+		die("deleting past buffer (offset is %d len is %d)\n", offset, buf->len);
 
 	int removed_len = 0;
 	if (do_not_calculate_charsize) {
 		removed_len = len;
 	} else {
 		while (len--) {
-			int charsize = t_decode_utf8_buffer(buffer->contents + offset, buffer->len - offset, NULL);
-			if (buffer->len - charsize < 0)
+			int charsize = t_decode_utf8_buffer(buf->contents + offset, buf->len - offset, NULL);
+			if (buf->len - charsize < 0)
 				return;
 			removed_len += charsize;
 		}
 	}
-	buffer->len -= removed_len;
-	memmove(buffer->contents+offset, buffer->contents+offset+removed_len, buffer->len-offset);
+	buf->len -= removed_len;
+	memmove(buf->contents+offset, buf->contents+offset+removed_len, buf->len-offset);
 	if (buffer_contents_updated && !do_not_callback)
-		buffer_contents_updated(buffer, term.c.x, term.c.y, BUFFER_CONTENT_NORMAL_EDIT);
+		buffer_contents_updated(buf, offset, BUFFER_CONTENT_NORMAL_EDIT);
+}
+
+int
+buffer_get_charsize(Rune u, int cur_x_pos)
+{
+	if (u == '\t')
+		return 8 - (cur_x_pos % tabspaces);
+	if (u == '\n')
+		return 0;
+	return wcwidth(u);
+
 }
 
 void
-buffer_x_scroll(Buffer* buffer, const int amount)
+buffer_offset_to_xy(struct window_buffer* buf, int offset, int maxx, int* cx, int* cy)
 {
-	buffer->x_scroll += amount;
-	if (buffer->x_scroll < 0) {
-		buffer->x_scroll = 0;
-		return;
-	}
+	assert(buf);
+	struct file_buffer* fb = get_file_buffer(buf);
 
-	// prevent you from scrolling outside of the screen
-	buffer_snap_cursor(buffer, 0);
-}
+	LIMIT(offset, 0, fb->len-1);
+	*cx = *cy = 0;
 
-void
-buffer_write_to_screen(Buffer* buffer)
-{
-	//TODO: render tabs
-	Glyph attr = term.c.attr;
-
-	int line = buffer->y_scroll;
-	const int xscroll = buffer->x_scroll;
-	int x = 0, y = 0;
-	tclearregion(0, 0, term.col-1, term.row-1);
-
-	char* repl = buffer->contents;
-	char* last = repl + buffer->len;
+	char* repl = fb->contents;
+	char* last = repl + offset;
 
 	char* new_repl;
+	if (WRAP_BUFFER && maxx > 0) {
+		int yscroll = 0;
+		while ((new_repl = memchr(repl, '\n', last - repl))) {
+			if (++yscroll >= buf->y_scroll)
+				break;
+			repl = new_repl+1;
+		}
+		*cy = yscroll - buf->y_scroll;
+	} else {
+		while ((new_repl = memchr(repl, '\n', last - repl))) {
+			repl = new_repl+1;
+			*cy += 1;
+		}
+		*cy -= buf->y_scroll;
+	}
+
+	while (repl < last) {
+#if WRAP_BUFFER
+		if (maxx > 0 && (*repl == '\n' || *cx >= maxx)) {
+			*cy += 1;
+			*cx = 0;
+			repl++;
+			continue;
+		}
+#endif // WRAP_BUFFER
+		if (*repl == '\t') {
+			repl++;
+			if (*cx <= 0) *cx += 1;
+			while (*cx % tabspaces != 0) *cx += 1;
+			*cx += 1;
+			continue;
+		}
+		Rune u;
+		repl += t_decode_utf8_buffer(repl, last - repl, &u);
+		*cx += wcwidth(u);
+	}
+}
+
+void
+buffer_write_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, int maxy)
+{
+	assert(buf);
+	struct file_buffer* fb = get_file_buffer(buf);
+
+	LIMIT(maxx, 0, term.col-1);
+	LIMIT(maxy, 0, term.row-1);
+	LIMIT(minx, 0, maxx-1);
+	LIMIT(miny, 0, maxy-1);
+
+	int x = minx, y = miny;
+	tsetregion(minx, miny, maxx, maxy, ' ');
+
+	// force the screen in a place where the cursor is visable
+	int ox, oy;
+	buffer_offset_to_xy(buf, buf->cursor_offset, maxx - minx, &ox, &oy);
+	ox += minx - maxx;
+	int xscroll = 0;
+	if (ox > 0)
+		xscroll = ox;
+	if (oy < 0) {
+		buf->y_scroll += oy;
+	} else {
+		oy += miny - maxy;
+		if (oy > 0)
+			buf->y_scroll += oy;
+	}
+	if (buf->y_scroll < 0)
+		buf->y_scroll = 0;
+
+	// move to y_scroll
+	char* repl = fb->contents;
+	char* last = repl + fb->len;
+	char* new_repl;
+	int line = buf->y_scroll;
 	while ((new_repl = memchr(repl, '\n', last - repl))) {
 		if (--line < 0)
 			break;
-		if (new_repl+1 < last) {
+		else if (new_repl+1 < last)
 			repl = new_repl+1;
-		} else {
+		else
 			return;
-		}
 	}
 
+	// actually write to the screen
+	int once = 0;
 	for (int charsize = 1; repl < last && charsize; repl += charsize) {
-		if (x - xscroll >= term.col)
+		// if the buffer being drawn is focused, set the cursor position global
+		if (!once && buf == focused_window && repl - fb->contents >= buf->cursor_offset) {
+			once = 1;
+			cursor_x = x;
+			cursor_y = y;
+			LIMIT(cursor_x, minx, maxx);
+			LIMIT(cursor_y, miny, maxy);
+		}
+
+
+#if WRAP_BUFFER
+		xscroll = 0;
+		if (*repl == '\n' || x >= maxx) {
+#else
+		if (x - xscroll > maxx)
 			repl = memchr(repl, '\n', last - repl);
 
 		if (*repl == '\n') {
-			x = 0;
-			if (++y >= term.row)
+#endif // WRAP_BUFFER
+
+			x = minx;
+			if (++y > maxy)
 				break;
+
+#if WRAP_BUFFER
+			if (*repl == '\n') {
+				charsize = 1;
+				continue;
+			}
+#else
 			charsize = 1;
 			continue;
+#endif // WRAP_BUFFER
+
 		} else if (*repl == '\t') {
 			charsize = 1;
 			if (x <= 0) {
-				x += tsetchar(' ', attr, x - xscroll, y);
-				if (x >= term.col)
+				x += tsetchar(' ', x - xscroll, y);
+				if (x >= maxx)
 					continue;
 			}
-			while (abs(x) % tabspaces != 0 && x - xscroll < term.col)
-				x += tsetchar(' ', attr, x - xscroll, y);
+			while (x % tabspaces != 0 && x - xscroll <= maxx)
+				x += tsetchar(' ', x - xscroll, y);
 
-			if (x - xscroll >= term.col)
-				continue;
-			x += tsetchar(' ', attr, x, y);
+			if (x - xscroll <= maxx)
+				x += tsetchar(' ', x, y);
 			continue;
 		}
 
 		Rune u;
 		charsize = t_decode_utf8_buffer(repl, last - repl, &u);
-		int width = 1;
-		if (x - xscroll >= 0)
-			width = tsetchar(u, attr, x - xscroll, y);
+		int width;
+		if (x - xscroll >= minx)
+			width = tsetchar(u, x - xscroll, y);
+		else
+			width = wcwidth(u);
 		x += width;
 	}
 
+	buffer_write_selection(buf, minx, miny, maxx, maxy);
 }
 
 void
@@ -511,71 +760,58 @@ colour_selection(Glyph* letter)
 
 
 int
-buffer_is_selection_start_top_left(Buffer* buffer)
+buffer_is_selection_start_top_left(const struct file_buffer* buf)
 {
-	return (buffer->s1o <= buffer->s2o) ? 1 : 0;
+	return (buf->s1o <= buf->s2o) ? 1 : 0;
 }
 
 void
-buffer_move_cursor_to_selection_start(Buffer* buffer)
+buffer_move_cursor_to_selection_start(struct window_buffer* buf)
 {
-	if (buffer_is_selection_start_top_left(buffer))
-		buffer_move_cursor_to_offset(buffer, buffer->s1o, 0);
+	const struct file_buffer* fb = get_file_buffer(buf);
+	if (buffer_is_selection_start_top_left(fb))
+		buffer_move_to_offset(buf, fb->s1o, CURSOR_SNAPPED);
 	else
-		buffer_move_cursor_to_offset(buffer, buffer->s2o, 0);
+		buffer_move_to_offset(buf, fb->s2o, CURSOR_SNAPPED);
 }
 
 void
-set_selection_start_end(int* x1, int* x2, int* y1, int* y2, Buffer* buffer)
+buffer_write_selection(struct window_buffer* buf, int minx, int miny, int maxx, int maxy)
 {
-	int prevx = term.c.x, prevy = term.c.y;
-	int prevxscroll = buffer->x_scroll, prevyscroll = buffer->y_scroll;
-	buffer_move_cursor_to_offset(buffer, buffer->s1o, 1);
-	int s1xscroll = buffer->x_scroll, s1yscroll = buffer->y_scroll;
-	if (buffer_is_selection_start_top_left(buffer)) {
-		*x1 = term.c.x + (s1xscroll - prevxscroll);
-		*y1 = term.c.y + (s1yscroll - prevyscroll);
-		*x2 = prevx+1;
-		*y2 = prevy;
-	} else {
-		*x1 = prevx;
-		*y1 = prevy;
-		*x2 = term.c.x+1 + (s1xscroll - prevxscroll);
-		*y2 = term.c.y + (s1yscroll - prevyscroll);
-	}
-	buffer_move_cursor(buffer, prevx, prevy, 0);
-	buffer->x_scroll = prevxscroll;
-	buffer->y_scroll = prevyscroll;
-	LIMIT(*x1, 0, term.col-1);
-	LIMIT(*x2, 0, term.col-1);
-	LIMIT(*y1, 0, term.row-1);
-	LIMIT(*y2, 0, term.row-1);
-}
+	assert(buf);
+	struct file_buffer* fb = get_file_buffer(buf);
 
-void
-buffer_write_selection(Buffer* buffer)
-{
-	if (!(buffer->mode & BUFFER_SELECTION_ON))
-		return;
-
-	// colour selected area
-	int x, y, x2, y2;
+	LIMIT(maxx, 0, term.col-1);
+	LIMIT(maxy, 0, term.row-1);
+	LIMIT(minx, 0, maxx-1);
+	LIMIT(miny, 0, maxy-1);
 
 	//TODO: implement alternative selection modes
-	set_selection_start_end(&x, &x2, &y, &y2, buffer);
+	if (!(fb->mode & BUFFER_SELECTION_ON))
+		return;
+
+	int x, y, x2, y2;
+	if (buffer_is_selection_start_top_left(fb)) {
+		buffer_offset_to_xy(buf, fb->s1o, maxx - minx, &x, &y);
+		buffer_offset_to_xy(buf, fb->s2o, maxx - minx, &x2, &y2);
+	} else {
+		buffer_offset_to_xy(buf, fb->s2o, maxx - minx, &x, &y);
+		buffer_offset_to_xy(buf, fb->s1o, maxx - minx, &x2, &y2);
+	}
+	x += minx, x2 += minx + 1;
+	y += miny, y2 += miny;
+
 
 	for(; y < y2; y++) {
-		for(; x < term.col; x++) {
+		for(; x < maxx; x++)
 			colour_selection(&term.line[y][x]);
-		}
 		x = 0;
 	}
-	for(; x < x2; x++) {
+	for(; x < x2; x++)
 		colour_selection(&term.line[y][x]);
-	}
 }
 
-char* buffer_get_selection(Buffer* buffer, int* selection_len)
+char* buffer_get_selection(struct file_buffer* buffer, int* selection_len)
 {
 	if (!(buffer->mode & BUFFER_SELECTION_ON))
 		return NULL;
@@ -599,7 +835,7 @@ char* buffer_get_selection(Buffer* buffer, int* selection_len)
 }
 
 void
-buffer_remove_selection(Buffer* buffer)
+buffer_remove_selection(struct file_buffer* buffer)
 {
 	if (!(buffer->mode & BUFFER_SELECTION_ON))
 		return;
@@ -615,11 +851,11 @@ buffer_remove_selection(Buffer* buffer)
 	len = end - start;
 	buffer_remove(buffer, start, len, 1, 1);
 	if (buffer_contents_updated)
-		buffer_contents_updated(buffer, term.c.x, term.c.y, BUFFER_CONTENT_BIG_CHANGE);
+		buffer_contents_updated(buffer, start, BUFFER_CONTENT_BIG_CHANGE);
 }
 
 void
-buffer_write_to_filepath(const Buffer* buffer)
+buffer_write_to_filepath(const struct file_buffer* buffer)
 {
 	if (!buffer->file_path)
 		return;
@@ -627,6 +863,8 @@ buffer_write_to_filepath(const Buffer* buffer)
 	FILE* file = fopen(buffer->file_path, "w");
 	assert(file);
 
+	if (buffer->mode & BUFFER_UTF8_SIGNED)
+		fwrite("\xEF\xBB\xBF", 1, 3, file);
 	fwrite(buffer->contents, sizeof(char), buffer->len, file);
 
 	fclose(file);
@@ -642,105 +880,16 @@ t_decode_utf8_buffer(const char* buffer, const int buflen, Rune* u)
 	if (!u)
 		u = &u_tmp;
 
-	if (IS_SET(MODE_UTF8)) {
-		/* process a complete utf8 char */
-		charsize = utf8decode(buffer, u, buflen);
-	} else {
-		*u = buffer[0] & 0xFF;
-		charsize = 1;
-	}
+	/* process a complete utf8 char */
+	charsize = utf8decode(buffer, u, buflen);
 
 	return charsize;
 }
 
 int
-buffer_snap_cursor(Buffer* buffer, int do_not_callback)
+tsetchar(Rune u, int x, int y)
 {
-	char* repl = buffer->contents;
-	char* last = repl + buffer->len;
-	int line = buffer->y_scroll + term.c.y;
-	const int xscroll = buffer->x_scroll;
-	int x = 0, y = 0;
-
-	char* new_repl;
-	while ((new_repl = memchr(repl, '\n', last - repl))) {
-		if (line-- <= 0)
-			break;
-		else if (line - term.c.y < 0)
-			y++;
-
-		if (new_repl+1 < last) {
-			repl = new_repl+1;
-		} else {
-			buffer_move_cursor_to_offset(buffer, buffer->len, 0);
-			return buffer->len;
-		}
-	}
-
-	for (int charsize = 1; repl < last; repl += charsize) {
-		if (x - xscroll >= term.c.x || *repl == '\n') {
-			break;
-		} else if (*repl == '\t') {
-			int prevx = x;
-			if (x - xscroll + 1 == 0)
-				x++;
-			while ((x+1) % tabspaces != 0)
-				x++;
-			x += 2;
-			if (x - xscroll > term.c.x) {
-				x = prevx;
-				break;
-			}
-			charsize = 1;
-			continue;
-		}
-		Rune u;
-		if (!(charsize = t_decode_utf8_buffer(repl, last - repl, &u)))
-			return -1;
-		x += wcwidth(u);
-	}
-	x -= xscroll;
-	if (term.c.x != x || term.c.y != y)
-		buffer_move_cursor(buffer, x, y, (do_not_callback) ? 0 : CURSOR_SNAPPED);
-	return repl - buffer->contents;
-}
-
-void
-buffer_move_cursor_to_offset(Buffer* buffer, int offset, int do_not_callback)
-{
-	if (offset > buffer->len-1)
-		offset = buffer->len-1;
-	char* repl = buffer->contents;
-	char* last = repl + offset;
-	int x = 0, y = 0;
-
-	char* new_repl;
-	while ((new_repl = memchr(repl, '\n', last - repl))) {
-		y++;
-		repl = new_repl+1;
-	}
-	for (int charsize; repl < last; repl += charsize) {
-		Rune u;
-		if(!(charsize = t_decode_utf8_buffer(repl, last - repl, &u)))
-			return;
-		if (*repl == '\t') {
-			if (x == 0)
-				x++;
-			while (x % tabspaces != 0)
-				x++;
-			x++;
-		} else {
-			x += wcwidth(u);
-		}
-	}
-
-	buffer->x_scroll = buffer->y_scroll = 0;
-	buffer_move_cursor(buffer, x, y, (do_not_callback) ? 0 : CURSOR_SNAPPED);
-}
-
-int
-tsetchar(Rune u, Glyph attr, int x, int y)
-{
+	Glyph attr = default_attributes;
 	if (y >= term.row || x >= term.col ||
 		y < 0         || x < 0)
 		return 1;
@@ -761,7 +910,6 @@ tsetchar(Rune u, Glyph attr, int x, int y)
 		term.line[y][x-1].mode &= ~ATTR_WIDE;
 	}
 
-	term.dirty[y] = 1;
 	term.line[y][x] = attr;
 	term.line[y][x].u = u;
 
@@ -769,7 +917,7 @@ tsetchar(Rune u, Glyph attr, int x, int y)
 }
 
 void
-tclearregion(int x1, int y1, int x2, int y2)
+tsetregion(int x1, int y1, int x2, int y2, Rune u)
 {
 	int x, y, temp;
 
@@ -784,12 +932,11 @@ tclearregion(int x1, int y1, int x2, int y2)
 	LIMIT(y2, 0, term.row-1);
 
 	for (y = y1; y <= y2; y++) {
-		term.dirty[y] = 1;
 		for (x = x1; x <= x2; x++) {
-			term.line[y][x].fg = term.c.attr.fg;
-			term.line[y][x].bg = term.c.attr.bg;
+			term.line[y][x].fg = default_attributes.fg;
+			term.line[y][x].bg = default_attributes.bg;
 			term.line[y][x].mode = 0;
-			term.line[y][x].u = ' ';
+			term.line[y][x].u = u;
 		}
 	}
 }
@@ -800,7 +947,6 @@ tresize(int col, int row)
 	int i;
 	int minrow = MIN(row, term.row);
 	int mincol = MIN(col, term.col);
-	TCursor c;
 
 	if (col < 1 || row < 1) {
 		fprintf(stderr,
@@ -808,110 +954,48 @@ tresize(int col, int row)
 		return;
 	}
 
-	/*
-	 * slide screen to keep cursor where we expect it -
-	 * tscrollup would work here, but we can optimize to
-	 * memmove because we're freeing the earlier lines
-	 */
-	for (i = 0; i <= term.c.y - row; i++) {
-		free(term.line[i]);
-		free(term.alt[i]);
-	}
-	/* ensure that both src and dst are not NULL */
-	if (i > 0) {
-		memmove(term.line, term.line + i, row * sizeof(Line));
-		memmove(term.alt, term.alt + i, row * sizeof(Line));
-	}
-	for (i += row; i < term.row; i++) {
-		free(term.line[i]);
-		free(term.alt[i]);
-	}
-
 	/* resize to new height */
+	if (row < term.row)
+		for (i = row; i < term.row; i++)
+			free(term.line[i]);
+
 	term.line = xrealloc(term.line, row * sizeof(Line));
-	term.alt  = xrealloc(term.alt,  row * sizeof(Line));
-	term.dirty = xrealloc(term.dirty, row * sizeof(*term.dirty));
-	term.tabs = xrealloc(term.tabs, col * sizeof(*term.tabs));
+
+	if (row > term.row)
+		for (i = term.row; i < row; i++)
+			term.line[i] = NULL;
 
 	/* resize each row to new width, zero-pad if needed */
-	for (i = 0; i < minrow; i++) {
+	for (i = 0; i < row; i++)
 		term.line[i] = xrealloc(term.line[i], col * sizeof(Glyph));
-		term.alt[i]  = xrealloc(term.alt[i],  col * sizeof(Glyph));
-	}
 
-	/* allocate any new rows */
-	for (/* i = minrow */; i < row; i++) {
-		term.line[i] = xmalloc(col * sizeof(Glyph));
-		term.alt[i] = xmalloc(col * sizeof(Glyph));
-	}
-	if (col > term.col) {
-		int* bp = term.tabs + term.col;
-
-		memset(bp, 0, sizeof(*term.tabs) * (col - term.col));
-		while (--bp > term.tabs && !*bp)
-			/* nothing */ ;
-		for (bp += tabspaces; bp < term.tabs + col; bp += tabspaces)
-			*bp = 1;
-	}
 	/* update terminal size */
 	term.col = col;
 	term.row = row;
-	/* move cursor */
-	term.c.x = MIN(term.c.x, term.col-1);
-	term.c.y = MIN(term.c.y, term.row-1);
-	if (cursor_movement_callback)
-		cursor_movement_callback(term.c.x, term.c.y, CURSOR_WINDOW_RESIZED);
-	/* Clearing both screens (it makes dirty all lines) */
-	c = term.c;
-	for (i = 0; i < 2; i++) {
-		if (mincol < col && 0 < minrow) {
-			tclearregion(mincol, 0, col - 1, minrow - 1);
-		}
-		if (0 < col && minrow < row) {
-			tclearregion(0, minrow, col - 1, row - 1);
-		}
-		tswapscreen();
-	}
-	term.c = c;
+
+	/* Clear screen */
+	if (mincol < col && 0 < minrow)
+		tsetregion(mincol, 0, col - 1, minrow - 1, ' ');
+	if (0 < col && minrow < row)
+		tsetregion(0, minrow, col - 1, row - 1, ' ');
 }
 
-void
-resettitle(void)
-{
-	xsettitle(NULL);
-}
 
 void
-drawregion(int x1, int y1, int x2, int y2)
+draw(int cursor_x, int cursor_y)
 {
-	int y;
+	LIMIT(cursor_x, 0, term.col-1);
+	LIMIT(cursor_y, 0, term.row-1);
 
-	for (y = y1; y < y2; y++) {
-		if (!term.dirty[y])
-			continue;
-
-		term.dirty[y] = 0;
-		xdrawline(term.line[y], x1, y, x2);
-	}
-}
-
-void
-draw(void)
-{
 	if (!xstartdraw())
 		return;
-	if (term.line[term.c.y][term.c.x].mode & ATTR_WDUMMY)
-		term.c.x--;
+	if (term.line[cursor_y][cursor_x].mode & ATTR_WDUMMY)
+		cursor_x--;
 
-	drawregion(0, 0, term.col, term.row);
-	xdrawcursor(term.c.x, term.c.y, term.line[term.c.y][term.c.x]);
+	for (int y = 0; y < term.row; y++)
+		xdrawline(term.line[y], 0, y, term.col);
+
+	xdrawcursor(cursor_x, cursor_y, term.line[cursor_y][cursor_x]);
 
 	xfinishdraw();
-}
-
-void
-redraw(void)
-{
-	tfulldirt();
-	draw();
 }

@@ -1,4 +1,8 @@
 /* See LICENSE for license details. */
+#ifndef _WIN_H
+#define _WIN_H
+
+#include "st.h"
 
 enum win_mode {
 	MODE_VISIBLE     = 1 << 0,
@@ -21,8 +25,11 @@ void xfinishdraw(void);
 void xloadcols(void);
 int xsetcolorname(int, const char *);
 void xseticontitle(char *);
-void xsettitle(char *);
 int xsetcursor(int);
 void xsetpointermotion(int);
 int xstartdraw(void);
-void xximspot(int, int);
+
+struct file_buffer* get_file_buffer(struct window_buffer* buf);
+int new_file_buffer(struct file_buffer buf);
+
+#endif // _WIN_H

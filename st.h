@@ -1,4 +1,6 @@
 /* See LICENSE for license details. */
+#ifndef _ST_H
+#define _ST_H
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -14,8 +16,6 @@
 #define LIMIT(x, a, b)		(x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
 #define ATTRCMP(a, b)		((a).mode != (b).mode || (a).fg != (b).fg || \
 				(a).bg != (b).bg)
-#define TIMEDIFF(t1, t2)	((t1.tv_sec-t2.tv_sec)*1000 + \
-				(t1.tv_nsec-t2.tv_nsec)/1E6)
 #define MODBIT(x, set, bit)	((set) ? ((x) |= (bit)) : ((x) &= ~(bit)))
 
 #define TRUECOLOR(r,g,b)	(1 << 24 | (r) << 16 | (g) << 8 | (b))
@@ -43,13 +43,13 @@ typedef unsigned short ushort;
 
 typedef uint_least32_t Rune;
 
-#define Glyph Glyph_
 typedef struct {
 	Rune u;           /* character code */
 	ushort mode;      /* attribute flags */
 	uint32_t fg;      /* foreground  */
 	uint32_t bg;      /* background  */
-} Glyph;
+} Glyph_;
+#define Glyph Glyph_
 
 typedef Glyph *Line;
 
@@ -62,85 +62,99 @@ typedef union {
 	const char *s;
 } Arg;
 
+struct undo_buffer {
+	char* contents; // not null terminated
+	int len, capacity;
+	int cursor_offset;
+	int y_scroll;
+};
+
+struct window_buffer {
+	int y_scroll;
+	int cursor_offset;
+	int cursor_col; // last right_left movement for snapping the cursor
+
+	int buffer_index; // index into an array storing buffers
+};
+
+enum window_split_mode {
+	WINDOW_SINGULAR,
+	WINDOW_HORISONTAL,
+	WINDOW_VERTICAL,
+	WINDOW_HORISONTAL_NOT_RESISABLE,
+};
+#define IS_HORISONTAL(mode) ((mode) == WINDOW_HORISONTAL || (mode) == WINDOW_HORISONTAL_NOT_RESISABLE)
+
+struct window_split_node {
+	struct window_buffer window;
+	enum window_split_mode mode;
+	float ratio;
+	struct window_split_node *node1, *node2, *parent;
+};
+
+void window_buffer_split(struct window_split_node* parent, float ratio, enum window_split_mode mode);
+// uses focused_window to draw the cursor
+void window_write_tree_to_screen(struct window_split_node* root, int minx, int miny, int maxx, int maxy);
+
+enum move_directons {
+	MOVE_RIGHT,
+	MOVE_LEFT,
+	MOVE_UP,
+	MOVE_DOWN,
+};
+struct window_split_node* window_switch_to_window(struct window_split_node* current, enum move_directons move);
+
+
 enum buffer_flags {
 	BUFFER_SELECTION_ON = 1 << 0,
 	BUFFER_BLOCK_SELECT = 1 << 1,
 	BUFFER_READ_ONLY    = 1 << 2,
-};
-
-struct undo_buffer {
-	char* contents; // not null terminated
-	int len, capacity;
-	int cx, cy; // cursor x and y
-	int xscroll, yscroll;
+	BUFFER_UTF8_SIGNED  = 1 << 3,
 };
 
 /* Contents of a file buffer */
-typedef struct {
+struct file_buffer {
 	char* file_path;
 	char* contents; // !! NOT NULL TERMINATED !!
 	int len;
 	int capacity;
-	int y_scroll, x_scroll;
-	int cursor_col;
 	int mode; // flags
-	int s1o, s2o; // selection start offset and end offset
 	struct undo_buffer* ub;
-	int undo_buffer_len;
 	int current_undo_buffer;
 	int available_redo_buffers;
-} Buffer;
+	int s1o, s2o; // selection start offset and end offset
+	//TODO: colour instructions
+};
 
-void bufferwrite(const char* buf, const int buflen);
-int  buffer_new(Buffer* buffer, char* file_path);
-void buffer_insert(Buffer* buffer, const char* new_content, const int len, const int offset, int do_not_callback);
-void buffer_change(Buffer* buffer, const char* new_content, const int len, const int offset, int do_not_callback);
-void buffer_remove(Buffer* buffer, const int offset, int len, int do_not_calculate_charsize, int do_not_callback);
-void buffer_write_to_screen(Buffer* buffer);
-void buffer_write_to_filepath(const Buffer* buffer);
-int  buffer_snap_cursor(Buffer* buffer, int do_not_callback);
-void buffer_move_cursor_to_offset(Buffer* buffer, int offset, int do_not_callback);
-void buffer_scroll(Buffer* buffer, int xscroll, int yscroll);
+struct file_buffer buffer_new(char* file_path);
+void buffer_insert(struct file_buffer* buf, const char* new_content, const int len, const int offset, int do_not_callback);
+void buffer_change(struct file_buffer* buf, const char* new_content, const int len, const int offset, int do_not_callback);
+void buffer_remove(struct file_buffer* buf, const int offset, int len, int do_not_calculate_charsize, int do_not_callback);
+void buffer_offset_to_xy(struct window_buffer* buf, int offset, int maxx, int* cx, int* cy);
+void buffer_write_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, int maxy);
+void buffer_write_to_filepath(const struct file_buffer* buffer);
 
-void buffer_write_selection(Buffer* buffer);
+void buffer_write_selection(struct window_buffer* buf, int minx, int miny, int maxx, int maxy);
 ///////////////////////////////////
 // returns a null terminated string containing the selection
 // the returned value must be freed by the reciever
 // for conveniance the length of the string may be taken with the pointer
 // a selection_len of NULL wil be ignored
-char* buffer_get_selection(Buffer* buffer, int* selection_len);
-int   buffer_is_selection_start_top_left(Buffer* buffer);
-void  buffer_move_cursor_to_selection_start(Buffer* buffer);
-void  buffer_remove_selection(Buffer* buffer);
+char* buffer_get_selection(struct file_buffer* buf, int* selection_len);
+int   buffer_is_selection_start_top_left(const struct file_buffer* buffer);
+void  buffer_move_cursor_to_selection_start(struct window_buffer* buffer);
+void  buffer_remove_selection(struct file_buffer* buffer);
 
 void die(const char *, ...);
-void redraw(void);
-void draw(void);
 
-enum term_mode {
-	MODE_INSERT      = 1 << 1,
-	MODE_ALTSCREEN   = 1 << 2,
-	MODE_UTF8        = 1 << 6,
-};
-
-//TODO: make these attributes more fit this program
-typedef struct {
-	Glyph attr; /* current char attributes */
-	int x;
-	int y;
-} TCursor;
+void draw(int cursor_x, int cursor_y);
 
 /* Internal representation of the screen */
 typedef struct {
 	int row;      /* nb row */
 	int col;      /* nb col */
 	Line *line;   /* screen */
-	Line *alt;    /* alternate screen */
-	int *dirty;   /* dirtyness of lines */
-	TCursor c;    /* cursor */
 	int ocx, ocy; // old cursor
-	int mode;     /* terminal mode flags */
-	int *tabs;
 	Rune lastc;   /* last printed char outside of sequence, 0 if control */
 } Term;
 extern Term term;
@@ -148,15 +162,10 @@ extern Term term;
 int tattrset(int);
 void tnew(int, int);
 void tresize(int, int);
-void tsetdirtattr(int);
-
-int tisdirty();
-int tsetchar(Rune, Glyph, int, int);
-
-void resettitle(void);
+void tsetregion(int x1, int y1, int x2, int y2, Rune u);
+int tsetchar(Rune u, int x, int y);
 
 size_t utf8encode(Rune, char *);
-
 void *xmalloc(size_t);
 void *xrealloc(void *, size_t);
 
@@ -178,19 +187,27 @@ enum buffer_content_reason {
 	BUFFER_CONTENT_INIT,
 };
 
-void buffer_move_cursor(Buffer* buffer, int x, int y, enum cursor_reason callback_reason);
-void buffer_move_cursor_relative(Buffer* buffer, int x, int y, enum cursor_reason callback_reason);
+void buffer_move_on_line(struct window_buffer* buf, int amount, enum cursor_reason callback_reason);
+void buffer_move_lines(struct window_buffer* buf, int amount, enum cursor_reason callback_reason);
+void buffer_move_to_offset(struct window_buffer* buf, int offset, enum cursor_reason callback_reason);
+void buffer_move_to_x(struct window_buffer* buf, int x, enum cursor_reason callback_reason);
+int  buffer_seek_char(const struct file_buffer* buf, int offset, char byte);
+int  buffer_seek_char_backwards(const struct file_buffer* buf, int offset, char byte);
+int  buffer_seek_string(const struct file_buffer* buf, int offset, const char* string);
+int  buffer_seek_string_backwards(const struct file_buffer* buf, int offset, const char* string);
 
 /* callbacks */
-extern void(*cursor_movement_callback)(int, int, enum cursor_reason); // cursor x & y, callback_reason
-extern void(*buffer_contents_updated)(Buffer*, int, int, enum buffer_content_reason); // modified buffer, cursor x & y
+extern void(*cursor_movement_callback)(struct window_buffer*, enum cursor_reason); // buffer, current_pos, reason
+extern void(*buffer_contents_updated)(struct file_buffer*, int, enum buffer_content_reason); // modified buffer, current_pos
 // TODO: planned callbacks:
 // buffer written
 
 /* config.h globals */
+extern Glyph default_attributes;
 extern char *termname;
 extern unsigned int tabspaces;
-extern unsigned int defaultfg;
-extern unsigned int defaultbg;
-extern int default_mode;
-extern int undo_buffers;
+
+#define UNDO_BUFFERS_COUNT 32
+#define WRAP_BUFFER 0
+
+#endif // _ST_H
