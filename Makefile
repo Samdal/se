@@ -4,54 +4,54 @@
 
 include config.mk
 
-SRC = st.c x.c
+SRC = se.c x.c config.c
 OBJ = $(SRC:.c=.o)
 
-all: options st
+all: options se
 
 options:
-	@echo st build options:
-	@echo "CFLAGS  = $(STCFLAGS)"
-	@echo "LDFLAGS = $(STLDFLAGS)"
+	@echo se build options:
+	@echo "CFLAGS  = $(SECFLAGS)"
+	@echo "LDFLAGS = $(SELDFLAGS)"
 	@echo "CC      = $(CC)"
 
-config.h:
-	cp config.def.h config.h
+config.c:
+	cp config.def.c config.c
 
 .c.o:
-	$(CC) $(STCFLAGS) -c $<
+	$(CC) $(SECFLAGS) -c $<
 
-st.o: config.h st.h win.h
-x.o: config.h st.h win.h
+se.o: se.h x.h
+x.o: se.h x.h
 
-$(OBJ): config.h config.mk
+$(OBJ): config.c config.mk
 
-st: $(OBJ)
-	$(CC) -o $@ $(OBJ) $(STLDFLAGS)
+se: $(OBJ)
+	$(CC) -o $@ $(OBJ) $(SELDFLAGS)
 
 clean:
-	rm -f st $(OBJ) st-$(VERSION).tar.gz
+	rm -f se $(OBJ) se-$(VERSION).tar.gz
 
 dist: clean
-	mkdir -p st-$(VERSION)
-	cp -R FAQ LEGACY TODO LICENSE Makefile README config.mk\
-		config.def.h st.info st.1 arg.h st.h win.h $(SRC)\
-		st-$(VERSION)
-	tar -cf - st-$(VERSION) | gzip > st-$(VERSION).tar.gz
-	rm -rf st-$(VERSION)
+	mkdir -p se-$(VERSION)
+	cp -R LICENSE Makefile README config.mk\
+		config.def.c se.h x.h $(SRC)\
+		se-$(VERSION)
+	tar -cf - se-$(VERSION) | gzip > se-$(VERSION).tar.gz
+	rm -rf se-$(VERSION)
 
-install: st
+install: se
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
-	cp -f st $(DESTDIR)$(PREFIX)/bin
-	chmod 755 $(DESTDIR)$(PREFIX)/bin/st
-	mkdir -p $(DESTDIR)$(MANPREFIX)/man1
-	sed "s/VERSION/$(VERSION)/g" < st.1 > $(DESTDIR)$(MANPREFIX)/man1/st.1
-	chmod 644 $(DESTDIR)$(MANPREFIX)/man1/st.1
-	tic -sx st.info
-	@echo Please see the README file regarding the terminfo entry of st.
+	cp -f se $(DESTDIR)$(PREFIX)/bin
+	chmod 755 $(DESTDIR)$(PREFIX)/bin/se
+#	mkdir -p $(DESTDIR)$(MANPREFIX)/man1
+#	sed "s/VERSION/$(VERSION)/g" < se.1 > $(DESTDIR)$(MANPREFIX)/man1/st.1
+# chmod 644 $(DESTDIR)$(MANPREFIX)/man1/st.1
+#	tic -sx se.info
+#	@echo Please see the README file regarding the terminfo entry of se.
 
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/st
-	rm -f $(DESTDIR)$(MANPREFIX)/man1/st.1
+	rm -f $(DESTDIR)$(PREFIX)/bin/se
+#	rm -f $(DESTDIR)$(MANPREFIX)/man1/st.1
 
 .PHONY: all options clean dist install uninstall

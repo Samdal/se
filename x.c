@@ -1,103 +1,81 @@
 /* See LICENSE for license details. */
+
+/*
+** This file mainly contains X11 stuff (drawing to the screen, window hints, etc)
+** Most of that part is unchanged from ST (https://st.suckless.org/)
+** the main() function and the main loop are found at the very bottom of this file
+** there are a very few functions here that are interresting for configuratinos.
+** I would suggest looking into x.h and seeing if any of the callbacks fit
+** your configuration needs.
+*/
+
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
 #include <locale.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <time.h>
-
 #include <unistd.h>
-#include <X11/Xatom.h>
-#include <X11/Xlib.h>
-#include <X11/cursorfont.h>
-#include <X11/keysym.h>
-#include <X11/Xft/Xft.h>
-#include <X11/XKBlib.h>
+#include <dirent.h>
 
-#include "win.h"
+#include "x.h"
 
-/* config.h for applying patches and the configuration. */
-#include "config.h"
+/////////////////////////////////////////////////////
+// config.c variables that must be defined
+//
 
-#define Glyph Glyph_
+extern int border_px;
+extern float cw_scale;
+extern float ch_scale;
+extern char* fontconfig;
+extern const char* const colors[];
+extern Glyph default_attributes;
+extern unsigned int cursor_fg;
+extern unsigned int cursor_bg;
+extern unsigned int cursor_thickness;
+extern unsigned int cursor_shape;
+extern unsigned int default_cols;
+extern unsigned int default_rows;
 
-static void keep_cursor_col(struct window_buffer* buf, enum cursor_reason callback_reason);
-static void move_selection(struct window_buffer* buf, enum cursor_reason callback_reason);
+// callbacks
+extern void(*draw_callback)(void);
+extern void(*buffer_contents_updated)(struct file_buffer* modified_fb, int current_pos, enum buffer_content_reason reason);
+// non-zero return value means the kpress function will not proceed further
+extern int(*keypress_callback)(KeySym keycode, int modkey);
+extern void(*string_input_callback)(const char* buf, int len);
+// TODO: planned callbacks:
+// buffer focused
+// window focused
 
-static void add_to_undo_buffer(struct file_buffer* buffer, int offset, enum buffer_content_reason reason);
+//////////////////////////////////
+// macros
+//
 
-/* XEMBED messages */
+// X modifiers
+#define XK_ANY_MOD    UINT_MAX
+#define XK_NO_MOD     0
+#define XK_SWITCH_MOD (1<<13|1<<14)
+
+// XEMBED messages
 #define XEMBED_FOCUS_IN  4
 #define XEMBED_FOCUS_OUT 5
 
-/* macros */
 #define IS_SET(flag)		((win.mode & (flag)) != 0)
 #define TRUERED(x)		(((x) & 0xff0000) >> 8)
 #define TRUEGREEN(x)		(((x) & 0xff00))
 #define TRUEBLUE(x)		(((x) & 0xff) << 8)
+#define DEFAULT(a, b)		(a) = (a) ? (a) : (b)
+#define MODBIT(x, set, bit)	((set) ? ((x) |= (bit)) : ((x) &= ~(bit)))
+#define IS_TRUECOL(x)		(1 << 24 & (x))
+#define ATTRCMP(a, b)		((a).mode != (b).mode || (a).fg != (b).fg || (a).bg != (b).bg)
+#define DIVCEIL(n, d)		(((n) + ((d) - 1)) / (d))
 
-typedef XftDraw *Draw;
-typedef XftColor Color;
-typedef XftGlyphFontSpec GlyphFontSpec;
+////////////////////////////////////////
+// Internal Functions
+//
 
-/* Purely graphic info */
-typedef struct {
-	int tw, th; /* tty width and height */
-	int w, h; /* window width and height */
-	int ch; /* char height */
-	int cw; /* char width  */
-	int mode; /* window state/mode flags */
-	int cursor; /* cursor style */
-} TermWindow;
-
-typedef struct {
-	Display *dpy;
-	Colormap cmap;
-	Window win;
-	Drawable buf;
-	GlyphFontSpec *specbuf; /* font spec buffer used for rendering */
-	Atom xembed, wmdeletewin, netwmname, netwmiconname, netwmpid;
-	struct {
-		XIM xim;
-		XIC xic;
-		XPoint spot;
-		XVaNestedList spotlist;
-	} ime;
-	Draw draw;
-	Visual *vis;
-	XSetWindowAttributes attrs;
-	int scr;
-	int isfixed; /* is fixed geometry? */
-	int l, t; /* left and top offset */
-	int gm; /* geometry mask */
-} XWindow;
-
-/* Font structure */
-#define Font Font_
-typedef struct {
-	int height;
-	int width;
-	int ascent;
-	int descent;
-	int badslant;
-	int badweight;
-	short lbearing;
-	short rbearing;
-	XftFont *match;
-	FcFontSet *set;
-	FcPattern *pattern;
-} Font;
-
-/* Drawing Context */
-typedef struct {
-	Color *col;
-	size_t collen;
-	Font font, bfont, ifont, ibfont;
-	GC gc;
-} DC;
-
-static inline ushort sixd_to_16bit(int);
+static int file_browser_actions(KeySym keysym, int modkey);
+static void file_browser_string_insert(const char* buf, int buflen);
 static int xmakeglyphfontspecs(XftGlyphFontSpec *, const Glyph *, int, int, int);
 static void xdrawglyphfontspecs(const XftGlyphFontSpec *, Glyph, int, int, int);
 static void xdrawglyph(Glyph, int, int);
@@ -108,17 +86,17 @@ static void ximinstantiate(Display *, XPointer, XPointer);
 static void ximdestroy(XIM, XPointer, XPointer);
 static int xicdestroy(XIC, XPointer, XPointer);
 static void xinit(int, int);
-static void cresize(int, int);
 static void xresize(int, int);
-static void xhints(void);
 static int xloadcolor(int, const char *, Color *);
 static int xloadfont(Font *, FcPattern *);
-static void xloadfonts(const char *, double);
-static void xunloadfont(Font *);
-static void xunloadfonts(void);
 static void xsetenv(void);
 static void xseturgency(int);
 static void xsettitle(char *);
+static void run(void);
+
+///////////////////////////////////////////////////
+// X11 events
+//
 
 static void expose(XEvent *);
 static void visibility(XEvent *);
@@ -130,10 +108,6 @@ static void kpress(XEvent *);
 static void cmessage(XEvent *);
 static void resize(XEvent *);
 static void focus(XEvent *);
-static int  match(uint, uint);
-static void buffer_copy_ub_to_current(struct window_buffer* buffer);
-
-static void run(void);
 
 static void (*handler[LASTEvent])(XEvent *) = {
 	[KeyPress] = kpress,
@@ -149,216 +123,132 @@ static void (*handler[LASTEvent])(XEvent *) = {
 	[SelectionRequest] = selrequest,
 };
 
-/* Globals */
-static struct window_split_node root_node = {.mode = WINDOW_SINGULAR};
-static struct window_split_node* focused_node = &root_node;
+////////////////////////////////////////////////
+// Globals
+//
+
+extern Term term;
+static struct file_buffer* file_buffers;
+static int available_buffer_slots = 0;
+struct window_split_node root_node = {.mode = WINDOW_SINGULAR};
 
 // cursor is set when calling buffer_write_to_screen and the buffer is focused_window
-struct window_buffer* focused_window = {0};
-int cursor_x, cursor_y;
+struct window_split_node* focused_node = &root_node;
+struct window_buffer* focused_window = &root_node.window;
 
-static struct file_buffer* file_buffers;
-static int available_buffer_slots;
-static DC dc;
-static XWindow xw;
-static Atom xtarget;
-static char* copy_buffer;
-static int copy_len;
-static TermWindow win;
+Atom xtarget;
+char* copy_buffer;
+int copy_len;
+TermWindow win;
+DC dc;
+XWindow xw;
 
-/* Font Ring Cache */
-enum {
-	FRC_NORMAL,
-	FRC_ITALIC,
-	FRC_BOLD,
-	FRC_ITALICBOLD
-};
+// Fontcache is an array. A new font will be appended to the array.
+int frccap = 0;
+Fontcache *frc = NULL;
+int frclen = 0;
+double defaultfontsize = 0;
+double usedfontsize = 0;
 
-typedef struct {
-	XftFont *font;
-	int flags;
-	Rune unicodep;
-} Fontcache;
+/////////////////////////////////////////////////
+// function implementations
+//
 
-/* Fontcache is an array now. A new font will be appended to the array. */
-static Fontcache *frc = NULL;
-static int frclen = 0;
-static int frccap = 0;
-static char *usedfont = NULL;
-static double usedfontsize = 0;
-static double defaultfontsize = 0;
-
-static char *opt_class = NULL;
-static char **opt_cmd  = NULL;
-static char *opt_embed = NULL;
-static char *opt_font  = NULL;
-static char *opt_line  = NULL;
-static char *opt_name  = NULL;
-static char *opt_title = NULL;
-
-void
-numlock(const Arg *dummy)
+struct file_buffer*
+get_file_buffer(struct window_buffer* buf)
 {
-	win.mode ^= MODE_NUMLOCK;
-}
+	assert(buf);
+	assert(file_buffers);
 
-void window_split(const Arg *arg)
-{
-	window_buffer_split(focused_node, 0.5, arg->i);
-	focused_node = focused_node->node2;
-	focused_window = &focused_node->window;
-}
+	if (buf->buffer_index < 0)
+		buf->buffer_index = available_buffer_slots-1;
+	else if (buf->buffer_index >= available_buffer_slots)
+		buf->buffer_index = 0;
 
-void window_move(const Arg *arg)
-{
-	struct window_split_node* new_node = window_switch_to_window(focused_node, arg->i);
-	if (new_node->mode == WINDOW_SINGULAR) {
-		focused_node = new_node;
-		focused_window = &focused_node->window;
-	}
-}
-
-void
-zoom(const Arg *arg)
-{
-	Arg larg;
-
-	larg.f = usedfontsize + arg->f;
-	zoomabs(&larg);
-}
-
-void
-zoomabs(const Arg *arg)
-{
-	xunloadfonts();
-	xloadfonts(usedfont, arg->f);
-	cresize(0, 0);
-	xhints();
-}
-
-void
-zoomreset(const Arg *arg)
-{
-	Arg larg;
-
-	if (defaultfontsize > 0) {
-		larg.f = defaultfontsize;
-		zoomabs(&larg);
-	}
-}
-
-void
-cursor_move_x_relative(const Arg* arg)
-{
-	buffer_move_on_line(focused_window, arg->i, CURSOR_RIGHT_LEFT_MOVEMENT);
-}
-
-void
-cursor_move_y_relative(const Arg* arg)
-{
-	buffer_move_lines(focused_window, arg->i, 0);
-	buffer_move_to_x(focused_window, focused_window->cursor_col, CURSOR_UP_DOWN_MOVEMENT);
-}
-
-void
-save_buffer(const Arg* arg)
-{
-	buffer_write_to_filepath(get_file_buffer(focused_window));
-}
-
-void
-toggle_selection(const Arg* arg)
-{
-	struct file_buffer* fb = get_file_buffer(focused_window);
-	if (fb->mode & BUFFER_SELECTION_ON) {
-		fb->mode &= ~(BUFFER_SELECTION_ON);
+	if (!file_buffers[buf->buffer_index].contents) {
+		for(int n = 0; n < available_buffer_slots; n++) {
+			if (file_buffers[n].contents) {
+				buf->buffer_index = n;
+				assert(file_buffers[n].contents);
+				return &file_buffers[n];
+			}
+		}
 	} else {
-		fb->mode |= BUFFER_SELECTION_ON;
-		fb->s1o = fb->s2o = focused_window->cursor_offset;
+		assert(file_buffers[buf->buffer_index].contents);
+		return &file_buffers[buf->buffer_index];
 	}
+
+	buf->buffer_index = new_file_buffer_entry(NULL);
+	return get_file_buffer(buf);
+}
+
+int
+new_file_buffer_entry(const char* file_path)
+{
+	static char full_path[PATH_MAX];
+	if (!file_path)
+		file_path = "./";
+	assert(strlen(file_path) < PATH_MAX);
+
+	char* res = realpath(file_path, full_path);
+	if (available_buffer_slots) {
+		if (res) {
+			for(int n = 0; n < available_buffer_slots; n++)
+				if (file_buffers[n].contents)
+					if (strcmp(file_buffers[n].file_path, full_path) == 0)
+						return n;
+		} else {
+			strcpy(full_path, file_path);
+		}
+
+		for(int n = 0; n < available_buffer_slots; n++) {
+			if (!file_buffers[n].contents) {
+				file_buffers[n] = buffer_new(full_path);
+				return n;
+			}
+		}
+	}
+
+	available_buffer_slots++;
+	file_buffers = xrealloc(file_buffers, sizeof(struct file_buffer) * available_buffer_slots);
+	file_buffers[available_buffer_slots-1] = buffer_new(full_path);
+	return available_buffer_slots-1;
 }
 
 void
-move_cursor_to_offset(const Arg* arg)
+destroy_file_buffer_entry(struct window_split_node* node, struct window_split_node* root)
 {
-	focused_window->cursor_offset = arg->i;
-}
-
-void
-move_cursor_to_end_of_buffer(const Arg* arg)
-{
-	focused_window->cursor_offset = get_file_buffer(focused_window)->len-1;
-}
-
-void
-clipboard_copy(const Arg* arg)
-{
-	struct file_buffer* fb = get_file_buffer(focused_window);
-	int len;
-	char* temp = buffer_get_selection(fb, &len);
-	if (!temp)
+	// do not allow deletion of the lst file buffer
+	int n = 0;
+	for(; n < available_buffer_slots; n++)
+		if (file_buffers[n].contents && n != node->window.buffer_index)
+			break;
+	if (n >= available_buffer_slots)
 		return;
-	if (copy_buffer)
-		free(copy_buffer);
-	copy_buffer = temp;
-	copy_len = len;
 
-	buffer_move_cursor_to_selection_start(focused_window);
-	fb->mode &= ~BUFFER_SELECTION_ON;
-
-	Atom clipboard;
-	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
-	XSetSelectionOwner(xw.dpy, clipboard, xw.win, CurrentTime);
-}
-
-void
-clipboard_paste(const Arg* arg)
-{
-	Atom clipboard;
-
-	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
-	XConvertSelection(xw.dpy, clipboard, xtarget, clipboard,
-					  xw.win, CurrentTime);
-}
-
-void
-buffer_copy_ub_to_current(struct window_buffer* buffer)
-{
-	struct file_buffer* fb = get_file_buffer(buffer);
-	struct undo_buffer* cub = &fb->ub[fb->current_undo_buffer];
-	assert(cub->contents);
-
-	fb->contents = xrealloc(fb->contents, cub->capacity);
-	memcpy(fb->contents, cub->contents, cub->capacity);
-	fb->len = cub->len;
-	fb->capacity = cub->capacity;
-
-	buffer_move_to_offset(buffer, cub->cursor_offset, CURSOR_SNAPPED);
-	buffer->y_scroll = cub->y_scroll;
-}
-
-void
-undo(const Arg* arg)
-{
-	struct file_buffer* fb = get_file_buffer(focused_window);
-	if (fb->current_undo_buffer == 0)
+	if (window_other_nodes_contain_file_buffer(node, root)) {
+		node->window.buffer_index++;
+		node->window = window_buffer_new(node->window.buffer_index);
 		return;
-	fb->current_undo_buffer--;
-	fb->available_redo_buffers++;
+	}
+	buffer_destroy(get_file_buffer(&node->window));
 
-	buffer_copy_ub_to_current(focused_window);
+	if (node->window.mode == WINDOW_BUFFER_FILE_BROWSER)
+		node->window = window_buffer_new(node->window.cursor_col);
+	else
+		node->window = window_buffer_new(node->window.buffer_index);
 }
 
-void
-redo(const Arg* arg)
+int
+delete_selection(struct file_buffer* buf)
 {
-	struct file_buffer* fb = get_file_buffer(focused_window);
-	if (fb->available_redo_buffers == 0)
-		return;
-	fb->available_redo_buffers--;
-	fb->current_undo_buffer++;
-
-	buffer_copy_ub_to_current(focused_window);
+	if (buf->mode & BUFFER_SELECTION_ON) {
+		buffer_remove_selection(buf);
+		buffer_move_cursor_to_selection_start(focused_window);
+		buf->mode &= ~(BUFFER_SELECTION_ON);
+		return 1;
+	}
+	return 0;
 }
 
 void
@@ -425,14 +315,12 @@ selnotify(XEvent *e)
 			XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask,
 									&xw.attrs);
 
-			/*
-			 * Deleting the property is the transfer start signal.
-			 */
+			// Deleting the property is the transfer start signal.
 			XDeleteProperty(xw.dpy, xw.win, (int)property);
 			continue;
 		}
 
-		 // replace all '\r' with '\n'.
+		// replace all '\r' with '\n'.
 		repl = data;
 		last = data + nitems * format / 8;
 		while ((repl = memchr(repl, '\r', last - repl))) {
@@ -480,12 +368,12 @@ selrequest(XEvent *e)
 	if (xsre->property == None)
 		xsre->property = xsre->target;
 
-	/* reject */
+	// reject
 	xev.property = None;
 
 	xa_targets = XInternAtom(xw.dpy, "TARGETS", 0);
 	if (xsre->target == xa_targets) {
-		/* respond with the supported type */
+		// respond with the supported type
 		string = xtarget;
 		XChangeProperty(xsre->display, xsre->requestor, xsre->property,
 						XA_ATOM, 32, PropModeReplace,
@@ -520,127 +408,9 @@ selrequest(XEvent *e)
 		}
 	}
 
-	/* all done, send a notification to the listener */
+	// all done, send a notification to the listener
 	if (!XSendEvent(xsre->display, xsre->requestor, 1, 0, (XEvent *) &xev))
 		fprintf(stderr, "Error sending SelectionNotify event\n");
-}
-
-void
-keep_cursor_col(struct window_buffer* buf, enum cursor_reason callback_reason)
-{
-	static int last_cursor_col;
-
-	if (callback_reason == CURSOR_COMMAND_MOVEMENT || callback_reason == CURSOR_RIGHT_LEFT_MOVEMENT) {
-		int y;
-		buffer_offset_to_xy(buf, buf->cursor_offset, -1, &buf->cursor_col, &y);
-		last_cursor_col = buf->cursor_col;
-	} else if (callback_reason == CURSOR_WINDOW_RESIZED) {
-		int x, y;
-		buffer_offset_to_xy(buf, buf->cursor_offset, -1, &x, &y);
-		if (last_cursor_col != x)
-			buf->cursor_col = x;
-	}
-}
-
-void move_selection(struct window_buffer* buf, enum cursor_reason callback_reason)
-{
-	struct file_buffer* fb = get_file_buffer(buf);
-	if (fb->mode & BUFFER_SELECTION_ON) {
-		fb->s2o = buf->cursor_offset;
-	}
-}
-
-void
-cursor_callback(struct window_buffer* buf, enum cursor_reason callback_reason)
-{
-	keep_cursor_col(buf, callback_reason);
-	move_selection(buf, callback_reason);
-
-	printf("mved to: %d | reason: %d\n", buf->cursor_offset, callback_reason);
-}
-
-void
-add_to_undo_buffer(struct file_buffer* buffer, int offset, enum buffer_content_reason reason)
-{
-	static time_t last_normal_edit;
-	static int edits;
-
-	if (reason == BUFFER_CONTENT_NORMAL_EDIT) {
-		time_t previous_time = last_normal_edit;
-		last_normal_edit = time(NULL);
-
-		if (last_normal_edit - previous_time < 2 && edits < 30) {
-			edits++;
-			goto copy_undo_buffer;
-		} else {
-			edits = 0;
-		}
-	} else if (reason == BUFFER_CONTENT_INIT) {
-		goto copy_undo_buffer;
-	}
-
-	if (buffer->available_redo_buffers > 0) {
-		buffer->available_redo_buffers = 0;
-		buffer->current_undo_buffer++;
-		goto copy_undo_buffer;
-	}
-
-	if (buffer->current_undo_buffer == UNDO_BUFFERS_COUNT-1) {
-		char* begin_buffer = buffer->ub[0].contents;
-		memmove(buffer->ub, &(buffer->ub[1]), (UNDO_BUFFERS_COUNT-1) * sizeof(struct undo_buffer));
-		buffer->ub[buffer->current_undo_buffer].contents = begin_buffer;
-	} else {
-		buffer->current_undo_buffer++;
-	}
-
-copy_undo_buffer: ;
-	struct undo_buffer* cub = &buffer->ub[buffer->current_undo_buffer];
-
-	cub->contents = xrealloc(cub->contents, buffer->capacity);
-	memcpy(cub->contents, buffer->contents, buffer->capacity);
-	cub->len = buffer->len;
-	cub->capacity = buffer->capacity;
-	cub->cursor_offset = offset;
-	if (focused_window)
-		cub->y_scroll = focused_window->y_scroll;
-	else
-		cub->y_scroll = 0;
-}
-
-void
-buffer_content_callback(struct file_buffer* buffer, int offset, enum buffer_content_reason reason)
-{
-	add_to_undo_buffer(buffer, offset, reason);
-}
-
-struct file_buffer*
-get_file_buffer(struct window_buffer* buf)
-{
-	assert(file_buffers);
-
-	if (buf->buffer_index < 0)
-		buf->buffer_index = available_buffer_slots-1;
-	else if (buf->buffer_index >= available_buffer_slots)
-		buf->buffer_index = 0;
-
-	return (file_buffers[buf->buffer_index].contents) ? &(file_buffers[buf->buffer_index]) : NULL;
-}
-
-int
-new_file_buffer(struct file_buffer buf)
-{
-	assert(buf.contents);
-	for(int n = 0; n < available_buffer_slots; n++) {
-		if (!file_buffers[n].contents) {
-			file_buffers[n] = buf;
-			return n;
-		}
-	}
-
-	available_buffer_slots++;
-	file_buffers = xrealloc(file_buffers, sizeof(struct file_buffer) * available_buffer_slots);
-	file_buffers[available_buffer_slots-1] = buf;
-	return available_buffer_slots-1;
 }
 
 void
@@ -653,8 +423,8 @@ cresize(int width, int height)
 	if (height != 0)
 		win.h = height;
 
-	col = (win.w - 2 * borderpx) / win.cw;
-	row = (win.h - 2 * borderpx) / win.ch;
+	col = (win.w - 2 * border_px) / win.cw;
+	row = (win.h - 2 * border_px) / win.ch;
 	col = MAX(1, col);
 	row = MAX(1, row);
 
@@ -674,35 +444,16 @@ xresize(int col, int row)
 	XftDrawChange(xw.draw, xw.buf);
 	xclear(0, 0, win.w, win.h);
 
-	/* resize to new width */
+	// resize to new width
 	xw.specbuf = xrealloc(xw.specbuf, col * sizeof(GlyphFontSpec));
-}
-
-ushort
-sixd_to_16bit(int x)
-{
-	return x == 0 ? 0 : 0x3737 + 0x2828 * x;
 }
 
 int
 xloadcolor(int i, const char *name, Color *ncolor)
 {
-	XRenderColor color = { .alpha = 0xffff };
-
 	if (!name) {
-		if (BETWEEN(i, 16, 255)) { /* 256 color */
-			if (i < 6*6*6+16) { /* same colors as xterm */
-				color.red   = sixd_to_16bit( ((i-16)/36)%6 );
-				color.green = sixd_to_16bit( ((i-16)/6) %6 );
-				color.blue  = sixd_to_16bit( ((i-16)/1) %6 );
-			} else { /* greyscale */
-				color.red = 0x0808 + 0x0a0a * (i - (6*6*6+16));
-				color.green = color.blue = color.red;
-			}
-			return XftColorAllocValue(xw.dpy, xw.vis,
-			                          xw.cmap, &color, ncolor);
-		} else
-			name = colorname[i];
+		if (!(name = colors[i]))
+			return 0;
 	}
 
 	return XftColorAllocName(xw.dpy, xw.vis, xw.cmap, name, ncolor);
@@ -719,18 +470,20 @@ xloadcols(void)
 		for (cp = dc.col; cp < &dc.col[dc.collen]; ++cp)
 			XftColorFree(xw.dpy, xw.vis, xw.cmap, cp);
 	} else {
-		dc.collen = MAX(LEN(colorname), 256);
+		i = 0;
+		while (colors[i++])
+			;
+		dc.collen  = i;
 		dc.col = xmalloc(dc.collen * sizeof(Color));
+		loaded = 1;
 	}
 
-	for (i = 0; i < dc.collen; i++)
+	for (i = 0; i < dc.collen; i++) {
 		if (!xloadcolor(i, NULL, &dc.col[i])) {
-			if (colorname[i])
-				die("could not allocate color '%s'\n", colorname[i]);
-			else
-				die("could not allocate color %d\n", i);
+			if (colors[i])
+				die("could not allocate color '%s'\n", colors[i]);
 		}
-	loaded = 1;
+	}
 }
 
 int
@@ -750,9 +503,8 @@ xsetcolorname(int x, const char *name)
 	return 0;
 }
 
-/*
- * Absolute coordinates.
- */
+
+// Absolute coordinates.
 void
 xclear(int x1, int y1, int x2, int y2)
 {
@@ -763,8 +515,7 @@ xclear(int x1, int y1, int x2, int y2)
 void
 xhints(void)
 {
-	XClassHint class = {opt_name ? opt_name : termname,
-		opt_class ? opt_class : termname};
+	XClassHint class = {"se", "se"};
 	XWMHints wm = {.flags = InputHint, .input = 1};
 	XSizeHints *sizeh;
 
@@ -775,10 +526,10 @@ xhints(void)
 	sizeh->width = win.w;
 	sizeh->height_inc = win.ch;
 	sizeh->width_inc = win.cw;
-	sizeh->base_height = 2 * borderpx;
-	sizeh->base_width = 2 * borderpx;
-	sizeh->min_height = win.ch + 2 * borderpx;
-	sizeh->min_width = win.cw + 2 * borderpx;
+	sizeh->base_height = 2 * border_px;
+	sizeh->base_width = 2 * border_px;
+	sizeh->min_height = win.ch + 2 * border_px;
+	sizeh->min_width = win.cw + 2 * border_px;
 	if (xw.isfixed) {
 		sizeh->flags |= PMaxSize;
 		sizeh->min_width = sizeh->max_width = win.w;
@@ -866,6 +617,12 @@ xloadfont(Font *f, FcPattern *pattern)
 		}
 	}
 
+	// Printable characters in ASCII, used to estimate the advance width of single wide characters.
+	const char ascii_printable[] =
+		" !\"#$%&'()*+,-./0123456789:;<=>?"
+		"@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_"
+		"`abcdefghijklmnopqrstuvwxyz{|}~";
+
 	XftTextExtentsUtf8(xw.dpy, f->match,
 					   (const FcChar8 *) ascii_printable,
 					   strlen(ascii_printable), &extents);
@@ -933,8 +690,8 @@ xloadfonts(const char *fontstr, double fontsize)
 	}
 
 	/* Setting character width and height. */
-	win.cw = ceilf(dc.font.width * cwscale);
-	win.ch = ceilf(dc.font.height * chscale);
+	win.cw = ceilf(dc.font.width * cw_scale);
+	win.ch = ceilf(dc.font.height * ch_scale);
 
 	FcPatternDel(pattern, FC_SLANT);
 	FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ITALIC);
@@ -952,28 +709,6 @@ xloadfonts(const char *fontstr, double fontsize)
 		die("can't open font %s\n", fontstr);
 
 	FcPatternDestroy(pattern);
-}
-
-void
-xunloadfont(Font *f)
-{
-	XftFontClose(xw.dpy, f->match);
-	FcPatternDestroy(f->pattern);
-	if (f->set)
-		FcFontSetDestroy(f->set);
-}
-
-void
-xunloadfonts(void)
-{
-	/* Free the loaded fonts in the font cache.  */
-	while (frclen > 0)
-		XftFontClose(xw.dpy, frc[--frclen].font);
-
-	xunloadfont(&dc.font);
-	xunloadfont(&dc.bfont);
-	xunloadfont(&dc.ifont);
-	xunloadfont(&dc.ibfont);
 }
 
 int
@@ -1048,16 +783,15 @@ xinit(int cols, int rows)
 	if (!FcInit())
 		die("could not init fontconfig.\n");
 
-	usedfont = (opt_font == NULL)? font : opt_font;
-	xloadfonts(usedfont, 0);
+	xloadfonts(fontconfig, 0);
 
 	/* colors */
 	xw.cmap = XDefaultColormap(xw.dpy, xw.scr);
 	xloadcols();
 
 	/* adjust fixed window geometry */
-	win.w = 2 * borderpx + cols * win.cw;
-	win.h = 2 * borderpx + rows * win.ch;
+	win.w = 2 * border_px + cols * win.cw;
+	win.h = 2 * border_px + rows * win.ch;
 	if (xw.gm & XNegative)
 		xw.l += DisplayWidth(xw.dpy, xw.scr) - win.w - 2;
 	if (xw.gm & YNegative)
@@ -1072,8 +806,7 @@ xinit(int cols, int rows)
 		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask;
 	xw.attrs.colormap = xw.cmap;
 
-	if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0))))
-		parent = XRootWindow(xw.dpy, xw.scr);
+	parent = XRootWindow(xw.dpy, xw.scr);
 	xw.win = XCreateWindow(xw.dpy, parent, xw.l, xw.t,
 						   win.w, win.h, 0, XDefaultDepth(xw.dpy, xw.scr), InputOutput,
 						   xw.vis, CWBackPixel | CWBorderPixel | CWBitGravity
@@ -1101,16 +834,16 @@ xinit(int cols, int rows)
 	}
 
 	/* white cursor, black outline */
-	cursor = XCreateFontCursor(xw.dpy, mouseshape);
+	cursor = XCreateFontCursor(xw.dpy, XC_xterm);
 	XDefineCursor(xw.dpy, xw.win, cursor);
 
-	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xmousefg) == 0) {
+	if (XParseColor(xw.dpy, xw.cmap, colors[cursor_fg], &xmousefg) == 0) {
 		xmousefg.red   = 0xffff;
 		xmousefg.green = 0xffff;
 		xmousefg.blue  = 0xffff;
 	}
 
-	if (XParseColor(xw.dpy, xw.cmap, colorname[mousebg], &xmousebg) == 0) {
+	if (XParseColor(xw.dpy, xw.cmap, colors[cursor_bg], &xmousebg) == 0) {
 		xmousebg.red   = 0x0000;
 		xmousebg.green = 0x0000;
 		xmousebg.blue  = 0x0000;
@@ -1142,7 +875,7 @@ xinit(int cols, int rows)
 int
 xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x, int y)
 {
-	float winx = borderpx + x * win.cw, winy = borderpx + y * win.ch, xp, yp;
+	float winx = border_px + x * win.cw, winy = border_px + y * win.ch, xp, yp;
 	ushort mode, prevmode = USHRT_MAX;
 	Font *font = &dc.font;
 	int frcflags = FRC_NORMAL;
@@ -1275,7 +1008,7 @@ void
 xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, int y)
 {
 	int charlen = len * ((base.mode & ATTR_WIDE) ? 2 : 1);
-	int winx = borderpx + x * win.cw, winy = borderpx + y * win.ch,
+	int winx = border_px + x * win.cw, winy = border_px + y * win.ch,
 	    width = charlen * win.cw;
 	Color *fg, *bg, *temp, revfg, truefg, truebg;
 	XRenderColor colfg, colbg;
@@ -1284,10 +1017,10 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	/* Fallback on color display for attributes not supported by the font */
 	if (base.mode & ATTR_ITALIC && base.mode & ATTR_BOLD) {
 		if (dc.ibfont.badslant || dc.ibfont.badweight)
-			base.fg = defaultattr;
+			base.fg = default_attributes.fg;
 	} else if ((base.mode & ATTR_ITALIC && dc.ifont.badslant) ||
 			   (base.mode & ATTR_BOLD && dc.bfont.badweight)) {
-		base.fg = defaultattr;
+		base.fg = default_attributes.fg;
 	}
 
 	if (IS_TRUECOL(base.fg)) {
@@ -1336,17 +1069,17 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 
 	/* Intelligent cleaning up of the borders. */
 	if (x == 0) {
-		xclear(0, (y == 0)? 0 : winy, borderpx,
+		xclear(0, (y == 0)? 0 : winy, border_px,
 			   winy + win.ch +
-			   ((winy + win.ch >= borderpx + win.th)? win.h : 0));
+			   ((winy + win.ch >= border_px + win.th)? win.h : 0));
 	}
-	if (winx + width >= borderpx + win.tw) {
+	if (winx + width >= border_px + win.tw) {
 		xclear(winx + width, (y == 0)? 0 : winy, win.w,
-			   ((winy + win.ch >= borderpx + win.th)? win.h : (winy + win.ch)));
+			   ((winy + win.ch >= border_px + win.th)? win.h : (winy + win.ch)));
 	}
 	if (y == 0)
-		xclear(winx, 0, winx + width, borderpx);
-	if (winy + win.ch >= borderpx + win.th)
+		xclear(winx, 0, winx + width, border_px);
+	if (winy + win.ch >= border_px + win.th)
 		xclear(winx, winy + win.ch, winx + width, win.h);
 
 	/* Clean up the region we want to draw to. */
@@ -1388,83 +1121,67 @@ xdrawglyph(Glyph g, int x, int y)
 }
 
 void
-xdrawcursor(int cx, int cy, Glyph g)
+xdrawcursor(int cx, int cy, int focused)
 {
-	Color drawcol;
+	LIMIT(cx, 0, term.col-1);
+	LIMIT(cy, 0, term.row-1);
+	Glyph g = term.line[cy][cx];
+	if (IS_SET(MODE_HIDE)) return;
 
-	if (IS_SET(MODE_HIDE))
-		return;
-
-	/*
-	 * Select the right color for the right mode.
-	 */
-	g.mode &= ATTR_BOLD|ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE;
-
-	g.fg = default_attributes.bg;
-	g.bg = defaultcs;
-	drawcol = dc.col[g.bg];
+	g.mode &= ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE;
+	g.fg = cursor_bg;
+	g.bg = cursor_fg;
+	Color drawcol = dc.col[g.bg];
 
 	/* draw the new one */
-	if (IS_SET(MODE_FOCUSED)) {
+	if (IS_SET(MODE_FOCUSED) && !(get_file_buffer(focused_window)->mode & BUFFER_SELECTION_ON) && focused) {
 		switch (win.cursor) {
-		case 7: /* st extension */
-			g.u = 0x2603; /* snowman (U+2603) */
-			/* FALLTHROUGH */
-		case 0: /* Blinking Block */
-		case 1: /* Blinking Block (Default) */
-		case 2: /* Steady Block */
+		case 0: // Blinking Block
+		case 1: // Blinking Block (Default)
+		case 2: // Steady Block
 			xdrawglyph(g, cx, cy);
 			break;
-		case 3: /* Blinking Underline */
-		case 4: /* Steady Underline */
+		case 3: // Blinking Underline
+		case 4: // Steady Underline
 			XftDrawRect(xw.draw, &drawcol,
-						borderpx + cx * win.cw,
-						borderpx + (cy + 1) * win.ch - \
-						cursorthickness,
-						win.cw, cursorthickness);
+						border_px + cx * win.cw,
+						border_px + (cy + 1) * win.ch - \
+						cursor_thickness,
+						win.cw, cursor_thickness);
 			break;
-		case 5: /* Blinking bar */
-		case 6: /* Steady bar */
+		case 5: // Blinking bar
+		case 6: // Steady bar
 			XftDrawRect(xw.draw, &drawcol,
-						borderpx + cx * win.cw,
-						borderpx + cy * win.ch,
-						cursorthickness, win.ch);
+						border_px + cx * win.cw,
+						border_px + cy * win.ch,
+						cursor_thickness, win.ch);
 			break;
 		}
 	} else {
 		XftDrawRect(xw.draw, &drawcol,
-					borderpx + cx * win.cw,
-					borderpx + cy * win.ch,
+					border_px + cx * win.cw,
+					border_px + cy * win.ch,
 					win.cw - 1, 1);
 		XftDrawRect(xw.draw, &drawcol,
-					borderpx + cx * win.cw,
-					borderpx + cy * win.ch,
+					border_px + cx * win.cw,
+					border_px + cy * win.ch,
 					1, win.ch - 1);
 		XftDrawRect(xw.draw, &drawcol,
-					borderpx + (cx + 1) * win.cw - 1,
-					borderpx + cy * win.ch,
+					border_px + (cx + 1) * win.cw - 1,
+					border_px + cy * win.ch,
 					1, win.ch - 1);
 		XftDrawRect(xw.draw, &drawcol,
-					borderpx + cx * win.cw,
-					borderpx + (cy + 1) * win.ch - 1,
+					border_px + cx * win.cw,
+					border_px + (cy + 1) * win.ch - 1,
 					win.cw, 1);
 	}
-}
-
-void
-xsetenv(void)
-{
-	char buf[sizeof(long) * 8 + 1];
-
-	snprintf(buf, sizeof(buf), "%lu", xw.win);
-	setenv("WINDOWID", buf, 1);
 }
 
 void
 xseticontitle(char *p)
 {
 	XTextProperty prop;
-	DEFAULT(p, opt_title);
+	DEFAULT(p, "se");
 
 	if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
 	                                &prop) != Success)
@@ -1478,7 +1195,7 @@ void
 xsettitle(char *p)
 {
 	XTextProperty prop;
-	DEFAULT(p, opt_title);
+	DEFAULT(p, "se");
 
 	if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
 	                                &prop) != Success)
@@ -1486,12 +1203,6 @@ xsettitle(char *p)
 	XSetWMName(xw.dpy, xw.win, &prop);
 	XSetTextProperty(xw.dpy, xw.win, &prop, xw.netwmname);
 	XFree(prop.value);
-}
-
-int
-xstartdraw(void)
-{
-	return IS_SET(MODE_VISIBLE);
 }
 
 void
@@ -1523,29 +1234,27 @@ xdrawline(Line line, int x1, int y1, int x2)
 		xdrawglyphfontspecs(specs, base, i, ox, y1);
 }
 
-void
-xfinishdraw(void)
-{
-	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w,
-			  win.h, 0, 0);
+void xsetenv(void) {
+	char buf[sizeof(long) * 8 + 1];
+	snprintf(buf, sizeof(buf), "%lu", xw.win);
+	setenv("WINDOWID", buf, 1);
+}
+
+int xstartdraw(void) {return IS_SET(MODE_VISIBLE);}
+
+void xfinishdraw(void) {
+	XCopyArea(xw.dpy, xw.buf, xw.win, dc.gc, 0, 0, win.w, win.h, 0, 0);
 	XSetForeground(xw.dpy, dc.gc, dc.col[default_attributes.bg].pixel);
 }
 
 void expose(XEvent *ev) {} // do nothing
 
-void
-visibility(XEvent *ev)
-{
+void visibility(XEvent *ev) {
 	XVisibilityEvent *e = &ev->xvisibility;
-
 	MODBIT(win.mode, e->state != VisibilityFullyObscured, MODE_VISIBLE);
 }
 
-void
-unmap(XEvent *ev)
-{
-	win.mode &= ~MODE_VISIBLE;
-}
+void unmap(XEvent *ev) {win.mode &= ~MODE_VISIBLE;}
 
 void
 xsetpointermotion(int set)
@@ -1554,23 +1263,43 @@ xsetpointermotion(int set)
 	XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask, &xw.attrs);
 }
 
-int
-xsetcursor(int cursor)
-{
+int xsetcursor(int cursor) {
 	if (!BETWEEN(cursor, 0, 7)) /* 7: st extension */
 		return 1;
 	win.cursor = cursor;
 	return 0;
 }
 
-void
-xseturgency(int add)
-{
+void xseturgency(int add) {
 	XWMHints *h = XGetWMHints(xw.dpy, xw.win);
-
 	MODBIT(h->flags, add, XUrgencyHint);
 	XSetWMHints(xw.dpy, xw.win, h);
 	XFree(h);
+}
+
+void
+xunloadfonts(void)
+{
+	/* Free the loaded fonts in the font cache.  */
+	while (frclen > 0)
+		XftFontClose(xw.dpy, frc[--frclen].font);
+
+	xunloadfont(&dc.font);
+	xunloadfont(&dc.bfont);
+	xunloadfont(&dc.ifont);
+	xunloadfont(&dc.ibfont);
+}
+
+void
+xunloadfont(Font *f)
+{
+	assert(f);
+	assert(f->match);
+	assert(f->pattern);
+	XftFontClose(xw.dpy, f->match);
+	FcPatternDestroy(f->pattern);
+	if (f->set)
+		FcFontSetDestroy(f->set);
 }
 
 void
@@ -1594,8 +1323,141 @@ focus(XEvent *ev)
 }
 
 int
-match(uint mask, uint state)
+file_browser_actions(KeySym keysym, int modkey)
 {
+	static char full_path[PATH_MAX];
+	static char filename[PATH_MAX];
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	int offset = fb->len;
+
+	switch (keysym) {
+		float new_font_size;
+		int new_fb;
+	case XK_BackSpace:
+		if (offset <= 0) {
+			char* dest = strrchr(fb->file_path, '/');
+			printf("%ld\n", dest - fb->file_path);
+			if (dest && dest != fb->file_path) *dest = 0;
+			return 1;
+		}
+
+		focused_window->cursor_offset = offset;
+		buffer_move_on_line(focused_window, -1, 0);
+		offset = focused_window->cursor_offset;
+
+		buffer_remove(fb, offset, 1, 0, 0);
+		focused_window->y_scroll = 0;
+		return 1;
+	case XK_Tab:
+	case XK_Return:
+	{
+		char* path = file_path_get_path(fb->file_path);
+		buffer_change(fb, "\0", 1, fb->len, 1);
+		if (fb->len > 0) fb->len--;
+
+		DIR *dir = opendir(path);
+		for (int y = 0; file_browser_next_item(dir, path, fb->contents, full_path, filename); y++) {
+			if (y == focused_window->y_scroll) {
+				if (path_is_folder(full_path)) {
+					strcat(full_path, "/");
+					strcpy(fb->file_path, full_path);
+
+					fb->len = 0;
+					fb->contents[0] = '\0';
+					focused_window->y_scroll = 0;
+					focused_window->y_scroll = 0;
+
+					free(path);
+					closedir(dir);
+					return 1;
+				}
+				goto open_file;
+			}
+		}
+
+		if (fb->contents[fb->len-1] == '/') {
+			free(path);
+			closedir(dir);
+			return 1;
+		}
+
+		strcpy(full_path, path);
+		strcat(full_path, fb->contents);
+open_file:
+		new_fb = new_file_buffer_entry(full_path);
+		destroy_file_buffer_entry(focused_node, &root_node);
+		focused_node->window = window_buffer_new(new_fb);
+		free(path);
+		closedir(dir);
+		return 1;
+	}
+	case XK_Down:
+		focused_window->y_scroll++;
+		if (focused_window->y_scroll < 0)
+			focused_window->y_scroll = 0;
+		return 1;
+	case XK_Up:
+		focused_window->y_scroll--;
+		if (focused_window->y_scroll < 0)
+			focused_window->y_scroll = 0;
+		return 1;
+	case XK_Escape:
+		destroy_file_buffer_entry(focused_node, &root_node);
+		return 1;
+
+	case XK_Page_Down:
+		new_font_size = usedfontsize-1.0;
+		goto set_fontsize;
+	case XK_Page_Up:
+		new_font_size = usedfontsize+1.0;
+		goto set_fontsize;
+	case XK_Home:
+		new_font_size = defaultfontsize;
+	set_fontsize:
+		xunloadfonts();
+		xloadfonts(fontconfig, new_font_size);
+		cresize(0, 0);
+		xhints();
+		return 1;
+	}
+	return 0;
+}
+
+void
+file_browser_string_insert(const char* buf, int buflen)
+{
+	static char full_path[PATH_MAX];
+	struct file_buffer* fb = get_file_buffer(focused_window);
+
+	if (fb->len + buflen + strlen(fb->file_path) > PATH_MAX)
+		return;
+
+	if (buf[0] >= 32 || buflen > 1) {
+		buffer_insert(fb, buf, buflen, fb->len, 0);
+		buffer_move_offset_relative(focused_window, buflen, 0);
+		focused_window->y_scroll = 0;
+
+		if (*buf == '/') {
+			buffer_change(fb, "\0", 1, fb->len, 0);
+			if (fb->len > 0) fb->len--;
+			char* path = file_path_get_path(fb->file_path);
+			strcpy(full_path, path);
+			strcat(full_path, fb->contents);
+
+			free(path);
+
+			if (path_is_folder(full_path)) {
+				file_browser_actions(XK_Return, 0);
+				return;
+			}
+		}
+	} else {
+		printf("unhandled control character %x\n", buf[0]);
+	}
+}
+
+int match(uint mask, uint state) {
+	const uint ignoremod = Mod2Mask|XK_SWITCH_MOD;
 	return mask == XK_ANY_MOD || mask == (state & ~ignoremod);
 }
 
@@ -1608,7 +1470,6 @@ kpress(XEvent *ev)
 	int len;
 	Rune c;
 	Status status;
-	Shortcut *bp;
 
 	if (IS_SET(MODE_KBDLOCK))
 		return;
@@ -1617,120 +1478,38 @@ kpress(XEvent *ev)
 		len = XmbLookupString(xw.ime.xic, e, buf, sizeof buf, &ksym, &status);
 	else
 		len = XLookupString(e, buf, sizeof buf, &ksym, NULL);
-	/* 1. shortcuts */
-	for (bp = shortcuts; bp < shortcuts + LEN(shortcuts); bp++) {
-		if (ksym == bp->keysym && match(bp->mod, e->state)) {
-			bp->func(&(bp->arg));
+
+	// keysym callback
+	if (focused_window->mode == WINDOW_BUFFER_FILE_BROWSER) {
+		if(file_browser_actions(ksym, e->state))
 			return;
-		}
-	}
-
-	/* 2. defaults for actions like backspace, del, enter etc*/
-	int offset = focused_window->cursor_offset;
-	struct file_buffer* fb = get_file_buffer(focused_window);
-
-	if (offset == -1)
-		return;
-
-	switch (ksym) {
-	case XK_BackSpace:
-		if (fb->mode & BUFFER_SELECTION_ON) {
-			buffer_remove_selection(fb);
-			buffer_move_cursor_to_selection_start(focused_window);
-			fb->mode &= ~(BUFFER_SELECTION_ON);
+	} else if (keypress_callback) {
+		if (keypress_callback(ksym, e->state))
 			return;
-		}
-		if (offset <= 0) return;
+	}
 
-		if (fb->contents[offset-1] == '\n') {
-			buffer_move_lines(focused_window, -1, CURSOR_COMMAND_MOVEMENT);
-		} else {
-			buffer_move_on_line(focused_window, -1, CURSOR_COMMAND_MOVEMENT);
-		}
-		offset = focused_window->cursor_offset;
-
-		/* FALLTHROUGH */
-	case XK_Delete:
-		if (fb->mode & BUFFER_SELECTION_ON) {
-			buffer_remove_selection(fb);
-			buffer_move_cursor_to_selection_start(focused_window);
-			fb->mode &= ~(BUFFER_SELECTION_ON);
+	// composed string from input method and send to callback
+	if (string_input_callback) {
+		if (len == 0)
 			return;
+		if (len == 1 && e->state & Mod1Mask) {
+			if (*buf < 0177) {
+				c = *buf | 0x80;
+				len = utf8encode(c, buf);
+			}
 		}
-		buffer_remove(fb, offset, 1, 0, 0);
-		return;
-	case XK_Return:
-		if (fb->mode & BUFFER_SELECTION_ON) {
-			buffer_remove_selection(fb);
-			buffer_move_cursor_to_selection_start(focused_window);
-			fb->mode &= ~(BUFFER_SELECTION_ON);
-			offset = focused_window->cursor_offset;
-		}
-		buffer_insert(fb, "\n", 1, offset, 0);
-		buffer_move_to_offset(focused_window, offset+1, CURSOR_COMMAND_MOVEMENT);
-		return;
-	case XK_Home: {
-		int new_offset = buffer_seek_char_backwards(fb, offset, '\n');
-		if (new_offset < 0)
-			new_offset = 0;
-		buffer_move_to_offset(focused_window, new_offset, CURSOR_COMMAND_MOVEMENT);
-		return;
-	}
-	case XK_End: {
-		int new_offset = buffer_seek_char(fb, offset, '\n');
-		if (new_offset < 0)
-			new_offset = fb->len-1;
-		buffer_move_to_offset(focused_window, new_offset, CURSOR_COMMAND_MOVEMENT);
-		return;
-	}
-	case XK_Page_Down:
-		buffer_move_lines(focused_window, (term.row-1) / 2, CURSOR_COMMAND_MOVEMENT);
-		focused_window->y_scroll += (term.row-1) / 2;
-		//TODO: make cursor follow
-		return;
-	case XK_Page_Up:
-		buffer_move_lines(focused_window, -((term.row-1) / 2), CURSOR_COMMAND_MOVEMENT);
-		focused_window->y_scroll -= (term.row-1) / 2;
-		//TODO: make cursor follow
-		return;
-	case XK_Tab:
-		buffer_insert(fb, "\t", 1, offset, 0);
-		buffer_move_on_line(focused_window, 1, CURSOR_COMMAND_MOVEMENT);
-		return;
-	}
-	//TODO: keybinds for escape and tab
-
-	/* 3. composed string from input method */
-	if (len == 0)
-		return;
-	if (len == 1 && e->state & Mod1Mask) {
-		if (*buf < 0177) {
-			c = *buf | 0x80;
-			len = utf8encode(c, buf);
-		}
-	}
-
-	// TODO: allow blocking of the bufferwrite, redirecting to keybinds with multiple characther length
-	if (buf[0] >= 32) {
-		if (fb->mode & BUFFER_SELECTION_ON) {
-			buffer_remove_selection(fb);
-			buffer_move_cursor_to_selection_start(focused_window);
-			fb->mode &= ~(BUFFER_SELECTION_ON);
-		}
-		buffer_insert(fb, buf, len, offset, 0);
-		buffer_move_on_line(focused_window, 1, CURSOR_COMMAND_MOVEMENT);
-	} else {
-		printf("unhandled control character %x\n", buf[0]);
+		if (focused_window->mode == WINDOW_BUFFER_FILE_BROWSER)
+			file_browser_string_insert(buf, len);
+		else
+			string_input_callback(buf, len);
 	}
 }
 
 void
 cmessage(XEvent *e)
 {
-	/*
-	 * See xembed specs
-	 *  http://standards.freedesktop.org/xembed-spec/xembed-spec-latest.html
-	 */
+	// See xembed specs
+	//  http://standards.freedesktop.org/xembed-spec/xembed-spec-latest.html
 	if (e->xclient.message_type == xw.xembed && e->xclient.format == 32) {
 		if (e->xclient.data.l[1] == XEMBED_FOCUS_IN) {
 			win.mode |= MODE_FOCUSED;
@@ -1758,7 +1537,7 @@ run(void)
 	XEvent ev;
 	int w = win.w, h = win.h;
 
-	/* Waiting for window mapping */
+	// Waiting for window mapping
 	do {
 		XNextEvent(xw.dpy, &ev);
 		/*
@@ -1794,11 +1573,13 @@ run(void)
 			continue;
 		}
 
-
 		tsetregion(0, 0, term.col-1, term.row-1, ' ');
-		window_write_tree_to_screen(&root_node, 0, 0, term.col-1, term.row-1);
+		window_draw_tree_to_screen(&root_node, 0, 0, term.col-1, term.row-1);
 
-		draw(cursor_x,cursor_y);
+		if (draw_callback)
+			draw_callback();
+
+		xfinishdraw();
 		XFlush(xw.dpy);
 	}
 }
@@ -1808,32 +1589,45 @@ main(int argc, char *argv[])
 {
 	xw.l = xw.t = 0;
 	xw.isfixed = False;
-	xsetcursor(cursorshape);
-
-	if (argc > 0) /* eat all remaining arguments */
-		opt_cmd = argv;
-
-	if (!opt_title)
-		opt_title = (opt_line || !opt_cmd) ? "st" : opt_cmd[0];
+	xsetcursor(cursor_shape);
 
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
-	cols = MAX(cols, 1);
-	rows = MAX(rows, 1);
+	int cols = MAX(default_cols, 1);
+	int rows = MAX(default_rows, 1);
 	tnew(cols, rows);
 	xinit(cols, rows);
 	xsetenv();
 
-	//buffer_new("/home/halvard/gunslinger/gs.h");
-	//buffer_new("/home/halvard/test.c");
+	if (argc <= 1) {
+		*focused_window = window_buffer_new(new_file_buffer_entry(NULL));
+	} else  {
+		int master_stack = 1;
+		for (int i = 1; i < argc; i++) {
+			if (*argv[i] == '-') {
+				i++;
+			} else {
+				if (master_stack < 0) {
+					window_node_split(focused_node, 0.5, WINDOW_HORISONTAL);
+					master_stack = 0;
+				} else if (master_stack) {
+					*focused_window = window_buffer_new(new_file_buffer_entry(argv[i]));
+					master_stack = -1;
+					continue;
+				} else {
+					window_node_split(focused_node, 0.5, WINDOW_VERTICAL);
+				}
+				if (focused_node->node2) {
+					focused_node = focused_node->node2;
+					focused_window = &focused_node->window;
+					if (!master_stack)
+						*focused_window = window_buffer_new(new_file_buffer_entry(argv[i]));
+				}
+				master_stack = 0;
+			}
+		}
+	}
 
-	root_node.mode = WINDOW_SINGULAR;
-	root_node.window.buffer_index =
-		new_file_buffer(buffer_new("/home/halvard/gunslinger/gs.h"));
-		//new_file_buffer(buffer_new("/home/halvard/Code/C/se/st/st.c"));
-		//new_file_buffer(buffer_new("/home/halvard/test.c"));
-	focused_node = &root_node;
-	focused_window = &focused_node->window;
 	run();
 
 	return 0;
