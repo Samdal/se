@@ -1,5 +1,4 @@
 *.o
 *.out
-st
 se
-config.h
+config.c
