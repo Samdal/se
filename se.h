@@ -12,6 +12,9 @@
 #define UTF_INVALID   0xFFFD
 #define UTF_SIZ       4
 #define UNDO_BUFFERS_COUNT 32
+#define UPPER_CASE_WORD_MIN_LEN 3
+#define STATUS_BAR_MAX_LEN 4096
+#define SEARCH_TERM_LEN 4096
 
 #define MIN(a, b)		((a) < (b) ? (a) : (b))
 #define MAX(a, b)		((a) < (b) ? (b) : (a))
@@ -210,16 +213,31 @@ struct file_buffer {
 	int s1o, s2o; // selection start offset and end offset
 };
 
+const struct color_scheme* buffer_get_color_scheme(struct file_buffer* fb);
 struct file_buffer buffer_new(const char* file_path);
 void buffer_destroy(struct file_buffer* fb);
 void buffer_insert(struct file_buffer* buf, const char* new_content, const int len, const int offset, int do_not_callback);
 void buffer_change(struct file_buffer* buf, const char* new_content, const int len, const int offset, int do_not_callback);
 int  buffer_remove(struct file_buffer* buf, const int offset, int len, int do_not_calculate_charsize, int do_not_callback);
 void buffer_write_to_filepath(const struct file_buffer* buffer);
-int  buffer_seek_char(const struct file_buffer* buf, int offset, char byte);
-int  buffer_seek_char_backwards(const struct file_buffer* buf, int offset, char byte);
-int  buffer_seek_string(const struct file_buffer* buf, int offset, const char* string);
-int  buffer_seek_string_backwards(const struct file_buffer* buf, int offset, const char* string);
+void buffer_undo(struct file_buffer* buf);
+void buffer_redo(struct file_buffer* buf);
+
+int buffer_is_on_a_word(const struct file_buffer* fb, int offset, const char* word_seperators);
+int buffer_is_start_of_a_word(const struct file_buffer* fb, int offset, const char* word_seperators);
+int buffer_is_on_word(const struct file_buffer* fb, int offset, const char* word_seperators, const char* word);
+int buffer_offset_starts_with(const struct file_buffer* fb, int offset, const char* start);
+int buffer_seek_char(const struct file_buffer* buf, int offset, char byte);
+int buffer_seek_char_backwards(const struct file_buffer* buf, int offset, char byte);
+int buffer_seek_string(const struct file_buffer* buf, int offset, const char* string);
+int buffer_seek_string_backwards(const struct file_buffer* buf, int offset, const char* string);
+int buffer_seek_word(const struct file_buffer* fb, int offset, const char* word_seperators);
+int buffer_seek_word_end(const struct file_buffer* fb, int offset, const char* word_seperators);
+int buffer_seek_word_backwards(const struct file_buffer* fb, int offset, const char* word_seperators);
+int buffer_seek_whitespace(const struct file_buffer* fb, int offset);
+int buffer_seek_whitespace_backwrads(const struct file_buffer* fb, int offset);
+int buffer_seek_not_whitespace(const struct file_buffer* fb, int offset);
+int buffer_seek_not_whitespace_backwrads(const struct file_buffer* fb, int offset);
 
 ///////////////////////////////////
 // returns a null terminated string containing the selection
@@ -238,22 +256,24 @@ void die(const char *, ...);
 int is_file_type(const char* file_path, const char* file_type);
 char* file_path_get_path(const char* path);
 int path_is_folder(const char* path);
-int file_browser_next_item(DIR* dir, const char* path, const char* search, char* full_path, char* filename);
+int file_browser_next_item(DIR* dir, const char* path, const char* search, char* full_path, char* filename, int* offset);
+int write_string(const char* string, int y, int minx, int maxx);
+int writef_to_status_bar(const char* fmt, ...);
+void draw_status_bar();
 
 // Internal representation of the screen
 typedef struct {
-	int row;      /* nb row */
-	int col;      /* nb col */
-	Line *line;   /* screen */
-	int ocx, ocy; // old cursor
-	Rune lastc;   /* last printed char outside of sequence, 0 if control */
+	int row;      // row count
+	int col;      // column count
+	Line *line;   // array
 } Term;
 
-int tattrset(int);
 void tnew(int, int);
 void tresize(int, int);
 void tsetregion(int x1, int y1, int x2, int y2, Rune u);
 int tsetchar(Rune u, int x, int y);
+Glyph* tsetattr(int x, int y);
+Rune tgetrune(int x, int y);
 
 size_t utf8encode(Rune, char *);
 void *xmalloc(size_t);
@@ -266,6 +286,8 @@ enum buffer_content_reason {
 	BUFFER_CONTENT_BIG_CHANGE,
 	BUFFER_CONTENT_INIT,
 };
+
+void buffer_add_to_undo(struct file_buffer* buffer, int offset, enum buffer_content_reason reason);
 
 enum buffer_flags {
 	BUFFER_SELECTION_ON = 1 << 0,
