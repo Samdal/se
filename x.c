@@ -15,6 +15,7 @@
 #include <locale.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <dirent.h>
 
@@ -128,13 +129,16 @@ static void (*handler[LASTEvent])(XEvent *) = {
 //
 
 extern Term term;
+
 static struct file_buffer* file_buffers;
 static int available_buffer_slots = 0;
-struct window_split_node root_node = {.mode = WINDOW_SINGULAR};
 
-// cursor is set when calling buffer_write_to_screen and the buffer is focused_window
+struct window_split_node root_node = {.mode = WINDOW_SINGULAR};
 struct window_split_node* focused_node = &root_node;
 struct window_buffer* focused_window = &root_node.window;
+
+char searc_term[SEARCH_TERM_LEN];
+int search_mode_on;
 
 Atom xtarget;
 char* copy_buffer;
@@ -193,10 +197,14 @@ new_file_buffer_entry(const char* file_path)
 	char* res = realpath(file_path, full_path);
 	if (available_buffer_slots) {
 		if (res) {
-			for(int n = 0; n < available_buffer_slots; n++)
-				if (file_buffers[n].contents)
-					if (strcmp(file_buffers[n].file_path, full_path) == 0)
+			for(int n = 0; n < available_buffer_slots; n++) {
+				if (file_buffers[n].contents) {
+					if (strcmp(file_buffers[n].file_path, full_path) == 0) {
+						writef_to_status_bar("buffer exits");
 						return n;
+					}
+				}
+			}
 		} else {
 			strcpy(full_path, file_path);
 		}
@@ -215,7 +223,7 @@ new_file_buffer_entry(const char* file_path)
 	return available_buffer_slots-1;
 }
 
-void
+int
 destroy_file_buffer_entry(struct window_split_node* node, struct window_split_node* root)
 {
 	// do not allow deletion of the lst file buffer
@@ -223,13 +231,16 @@ destroy_file_buffer_entry(struct window_split_node* node, struct window_split_no
 	for(; n < available_buffer_slots; n++)
 		if (file_buffers[n].contents && n != node->window.buffer_index)
 			break;
-	if (n >= available_buffer_slots)
-		return;
+	if (n >= available_buffer_slots) {
+		writef_to_status_bar("can't delete last buffer");
+		return 0;
+	}
 
 	if (window_other_nodes_contain_file_buffer(node, root)) {
 		node->window.buffer_index++;
 		node->window = window_buffer_new(node->window.buffer_index);
-		return;
+		writef_to_status_bar("swapped buffer");
+		return 0;
 	}
 	buffer_destroy(get_file_buffer(&node->window));
 
@@ -237,6 +248,8 @@ destroy_file_buffer_entry(struct window_split_node* node, struct window_split_no
 		node->window = window_buffer_new(node->window.cursor_col);
 	else
 		node->window = window_buffer_new(node->window.buffer_index);
+
+	return 1;
 }
 
 int
@@ -350,6 +363,31 @@ selnotify(XEvent *e)
 	 * next data chunk in the property.
 	 */
 	XDeleteProperty(xw.dpy, xw.win, (int)property);
+}
+
+void
+set_clipboard_copy(char* buffer, int len)
+{
+	if (!buffer)
+		return;
+	if (copy_buffer)
+		free(copy_buffer);
+	copy_buffer = buffer;
+	copy_len = len;
+
+	Atom clipboard;
+	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
+	XSetSelectionOwner(xw.dpy, clipboard, xw.win, CurrentTime);
+}
+
+void
+insert_clipboard_at_cursor()
+{
+	Atom clipboard;
+
+	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
+	XConvertSelection(xw.dpy, clipboard, xtarget, clipboard,
+					  xw.win, CurrentTime);
 }
 
 void
@@ -1178,6 +1216,21 @@ xdrawcursor(int cx, int cy, int focused)
 }
 
 void
+draw_horisontal_line(int y, int x1, int x2)
+{
+	if (y < 0 || y > term.row ||
+		x2 < x1 || x2 > term.col ||
+		x1 < 0 || x1 > x2-1)
+		return;
+
+	Color drawcol = dc.col[default_attributes.fg];
+	XftDrawRect(xw.draw, &drawcol,
+				border_px + x1 * win.cw,
+				border_px + (y + 1) * win.ch - cursor_thickness,
+				win.cw * (x2-x1+1), 1);
+}
+
+void
 xseticontitle(char *p)
 {
 	XTextProperty prop;
@@ -1206,8 +1259,12 @@ xsettitle(char *p)
 }
 
 void
-xdrawline(Line line, int x1, int y1, int x2)
+xdrawline(int x1, int y1, int x2)
 {
+	LIMIT(y1, 0, term.row);
+	LIMIT(x2, 0, term.col);
+	LIMIT(x1, 0, x2);
+	Line line = term.line[y1];
 	int i, x, ox, numspecs;
 	Glyph base, new;
 	XftGlyphFontSpec *specs = xw.specbuf;
@@ -1336,7 +1393,6 @@ file_browser_actions(KeySym keysym, int modkey)
 	case XK_BackSpace:
 		if (offset <= 0) {
 			char* dest = strrchr(fb->file_path, '/');
-			printf("%ld\n", dest - fb->file_path);
 			if (dest && dest != fb->file_path) *dest = 0;
 			return 1;
 		}
@@ -1356,7 +1412,8 @@ file_browser_actions(KeySym keysym, int modkey)
 		if (fb->len > 0) fb->len--;
 
 		DIR *dir = opendir(path);
-		for (int y = 0; file_browser_next_item(dir, path, fb->contents, full_path, filename); y++) {
+		int tmp;
+		for (int y = 0; file_browser_next_item(dir, path, fb->contents, full_path, filename, &tmp); y++) {
 			if (y == focused_window->y_scroll) {
 				if (path_is_folder(full_path)) {
 					strcat(full_path, "/");
@@ -1402,7 +1459,8 @@ open_file:
 			focused_window->y_scroll = 0;
 		return 1;
 	case XK_Escape:
-		destroy_file_buffer_entry(focused_node, &root_node);
+		if (destroy_file_buffer_entry(focused_node, &root_node))
+			writef_to_status_bar("file browser clsoed");
 		return 1;
 
 	case XK_Page_Down:
@@ -1529,6 +1587,7 @@ resize(XEvent *e)
 		return;
 
 	cresize(e->xconfigure.width, e->xconfigure.height);
+	writef_to_status_bar("window resize: %d:%d", term.col, term.row);
 }
 
 void
@@ -1574,7 +1633,9 @@ run(void)
 		}
 
 		tsetregion(0, 0, term.col-1, term.row-1, ' ');
-		window_draw_tree_to_screen(&root_node, 0, 0, term.col-1, term.row-1);
+		if (term.row-2 >= 0)
+			window_draw_tree_to_screen(&root_node, 0, 0, term.col-1, term.row-1);
+		draw_status_bar();
 
 		if (draw_callback)
 			draw_callback();
@@ -1583,13 +1644,14 @@ run(void)
 		XFlush(xw.dpy);
 	}
 }
-
+#include <sys/time.h>
 int
 main(int argc, char *argv[])
 {
 	xw.l = xw.t = 0;
 	xw.isfixed = False;
 	xsetcursor(cursor_shape);
+
 
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
@@ -1627,6 +1689,14 @@ main(int argc, char *argv[])
 			}
 		}
 	}
+
+	static const char* const welcome[] = {"Welcome to se!", "Good day", "Happy Coding", "se: the Simple Editor",
+		"Time to get some progress done!", "When someone extends se, will it be called sex?", "Ready for combat",
+		"Initialising...Done", "Fun fact: vscode has over two times as many lines describing dependencies than se has in total",
+		"You look based"};
+
+	srand(time(NULL));
+	writef_to_status_bar(welcome[rand() % LEN(welcome)]);
 
 	run();
 

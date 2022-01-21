@@ -10,6 +10,8 @@
 #include <errno.h>
 #include <assert.h>
 #include <ctype.h>
+#include <stdarg.h>
+#include <time.h>
 #include <dirent.h>
 
 #include "se.h"
@@ -19,24 +21,19 @@
 // config.c variables and globals
 //
 
-// default colors
 extern Glyph default_attributes;
 extern unsigned int alternate_bg_bright;
 extern unsigned int alternate_bg_dark;
-
 extern unsigned int cursor_fg;
 extern unsigned int cursor_bg;
 extern unsigned int mouse_line_bg;
-
 extern unsigned int selection_bg;
 extern unsigned int highlight_color;
 extern unsigned int path_color;
-
 extern unsigned int error_color;
 extern unsigned int warning_color;
 extern unsigned int ok_color;
 
-// other
 extern unsigned int tabspaces;
 extern int wrap_buffer;
 extern const struct color_scheme color_schemes[];
@@ -61,12 +58,11 @@ extern void(*buffer_written_to_screen_callback)(struct window_buffer*, int, int,
 // Internal functions
 //
 
-// path must be freed
 static void recursive_mkdir(char* path);
+static int writef_string(int y, int x1, int x2, const char* fmt, ...);
 static void draw_dir(const char* path, const char* search, int* sel, int minx, int miny, int maxx, int maxy, int focused);
 static void color_selection(Glyph* letter);
-static void do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset);
-static int  write_string(const char* string, int y, int minx, int maxx);
+static void do_color_scheme(struct file_buffer* fb, const struct color_scheme* cs, int offset);
 static int  str_contains_char(const char* string, char check);
 static int  t_decode_utf8_buffer(const char* buffer, const int buflen, Rune* u);
 static size_t utf8decode(const char *, Rune *, size_t);
@@ -74,6 +70,7 @@ static Rune utf8decodebyte(char, size_t *);
 static char utf8encodebyte(Rune, size_t);
 static size_t utf8validate(Rune *, size_t);
 static int is_correct_mode(enum window_split_mode mode, enum move_directons move);
+void buffer_copy_ub_to_current(struct window_buffer* buffer);
 
 ////////////////////////////////////////////
 // function implementations
@@ -182,16 +179,6 @@ die(const char *errstr, ...)
 	exit(1);
 }
 
-int
-tattrset(int attr)
-{
-	for (int i = 0; i < term.row-1; i++)
-		for (int j = 0; j < term.col-1; j++)
-			if (term.line[i][j].mode & attr)
-				return 1;
-	return 0;
-}
-
 void
 tnew(int col, int row)
 {
@@ -199,17 +186,28 @@ tnew(int col, int row)
 
 	term = (Term){0};
 	tresize(col, row);
-	tsetregion(0, 0, term.col-1, term.row-1, ' ');
 }
 
+const struct color_scheme*
+buffer_get_color_scheme(struct file_buffer* fb)
+{
+	for (int i = 0; color_schemes[i].file_ending; i++) {
+		if (is_file_type(fb->file_path, color_schemes[i].file_ending)) {
+			return &color_schemes[i];
+		}
+	}
+	return NULL;
+}
 
 struct window_buffer
 window_buffer_new(int buffer_index)
 {
 	struct window_buffer wb = {0};
 	wb.buffer_index = buffer_index;
-	if (path_is_folder(get_file_buffer(&wb)->file_path))
+	if (path_is_folder(get_file_buffer(&wb)->file_path)) {
 		wb.mode = WINDOW_BUFFER_FILE_BROWSER;
+		writef_to_status_bar("opened file browser %s", get_file_buffer(&wb)->file_path);
+	}
 
 	return wb;
 }
@@ -258,6 +256,98 @@ buffer_seek_string_backwards(const struct file_buffer* buf, int offset, const ch
 		if (!memcmp(buf->contents + n, string, str_len))
 			return n;
 	return -1;
+}
+
+int
+buffer_is_on_a_word(const struct file_buffer* fb, int offset, const char* word_seperators)
+{
+	LIMIT(offset, 0, fb->len);
+	return !str_contains_char(word_seperators, fb->contents[offset]);
+}
+
+int
+buffer_is_start_of_a_word(const struct file_buffer* fb, int offset, const char* word_seperators)
+{
+	return buffer_is_on_a_word(fb, offset, word_seperators) &&
+		(offset-1 <= 0 || str_contains_char(word_seperators, fb->contents[offset-1]));
+}
+
+int
+buffer_is_on_word(const struct file_buffer* fb, int offset, const char* word_seperators, const char* word)
+{
+	LIMIT(offset, 0, fb->len);
+	int word_start = buffer_seek_word_backwards(fb, offset, word_seperators);
+	int word_len = strlen(word);
+	if (word_start < offset - (word_len-1))
+		return 0;
+	return buffer_offset_starts_with(fb, word_start, word) &&
+		!buffer_is_on_a_word(fb, word_start + word_len, word_seperators);
+}
+
+int
+buffer_offset_starts_with(const struct file_buffer* fb, int offset, const char* start)
+{
+	LIMIT(offset, 0, fb->len);
+	int len = strlen(start);
+	if (len + offset > fb->len) return 0;
+
+	return memcmp(fb->contents + offset, start, len) == 0;
+}
+
+int
+buffer_seek_word(const struct file_buffer* fb, int offset, const char* word_seperators)
+{
+	if (buffer_is_on_a_word(fb, offset, word_seperators))
+		offset = buffer_seek_word_end(fb, offset, word_seperators);
+	while (offset < fb->len && !str_contains_char(word_seperators, fb->contents[offset])) offset++;
+	return offset;
+}
+
+int
+buffer_seek_word_end(const struct file_buffer* fb, int offset, const char* word_seperators)
+{
+	while (offset < fb->len && !str_contains_char(word_seperators, fb->contents[offset])) offset++;
+	return offset;
+}
+
+int
+buffer_seek_word_backwards(const struct file_buffer* fb, int offset, const char* word_seperators)
+{
+	LIMIT(offset, 0, fb->len);
+	if (!buffer_is_on_a_word(fb, offset, word_seperators))
+		while (offset > 0 && str_contains_char(word_seperators, fb->contents[offset])) offset--;
+	while (offset-1 > 0 && !str_contains_char(word_seperators, fb->contents[offset-1])) offset--;
+	return offset;
+}
+
+int
+buffer_seek_whitespace(const struct file_buffer* fb, int offset)
+{
+	while (offset < fb->len && !isspace(fb->contents[offset])) offset++;
+	return offset;
+}
+
+int
+buffer_seek_whitespace_backwrads(const struct file_buffer* fb, int offset)
+{
+	LIMIT(offset, 0, fb->len);
+	while (offset > 0 && !isspace(fb->contents[offset])) offset--;
+	return offset;
+}
+
+int
+buffer_seek_not_whitespace(const struct file_buffer* fb, int offset)
+{
+	while (offset < fb->len && isspace(fb->contents[offset])) offset++;
+	return offset;
+}
+
+int
+buffer_seek_not_whitespace_backwrads(const struct file_buffer* fb, int offset)
+{
+	LIMIT(offset, 0, fb->len);
+	while (offset > 0 && isspace(fb->contents[offset])) offset--;
+	return offset;
 }
 
 void
@@ -433,8 +523,10 @@ window_node_split(struct window_split_node* parent, float ratio, enum window_spl
 struct window_split_node*
 window_node_delete(struct window_split_node* node)
 {
-	if (!node->parent)
+	if (!node->parent) {
+		writef_to_status_bar("can't close root winodw");
 		return node;
+	}
 	struct window_split_node* old = node;
 	node = node->parent;
 	struct window_split_node* other = (node->node1 == old) ? node->node2 : node->node1;
@@ -468,63 +560,13 @@ window_draw_tree_to_screen(struct window_split_node* root, int minx, int miny, i
 		window_draw_tree_to_screen(root->node1, minx, miny, middlex, maxy);
 		window_draw_tree_to_screen(root->node2, middlex+2, miny, maxx, maxy);
 
-		// print connecting borders
-		if (middlex+1 >= term.col)
-			return;
-		if (miny-1 >= 0 && miny-1 < term.row) {
-			if (term.line[miny-1][middlex+1].u == L'┬' ||
-				term.line[miny-1][middlex+1].u == L'┴' ||
-				term.line[miny-1][middlex+1].u == L'├' ||
-				term.line[miny-1][middlex+1].u == L'┤')
-				tsetchar(L'┼', middlex+1, miny-1);
-			if (term.line[miny-1][middlex+1].u == L'─')
-				tsetchar(L'┬', middlex+1, miny-1);
-		}
-		if (maxy+1 >= 0 && maxy+1 < term.row) {
-			if (term.line[maxy+1][middlex+1].u == L'┬' ||
-				term.line[maxy+1][middlex+1].u == L'┴' ||
-				term.line[maxy+1][middlex+1].u == L'├' ||
-				term.line[maxy+1][middlex+1].u == L'┤')
-				tsetchar(L'┼', middlex+1, maxy+1);
-			if (term.line[maxy+1][middlex+1].u == L'─')
-				tsetchar(L'┴', middlex+1, maxy+1);
-		}
 		for (int y = miny; y < maxy+1; y++)
-			xdrawline(term.line[y], middlex+1, y, middlex+2);
+			xdrawline(middlex+1, y, middlex+2);
 	} else if (root->mode == WINDOW_VERTICAL) {
 		int middley = ((float)(maxy - miny) * root->ratio) + miny;
 
-		// print seperator
-		tsetregion(minx, middley+1, maxx, middley+1, L'─');
-		//write_string(get_file_buffer(&root->window)->file_path, middley+1, minx, maxx);
-
 		window_draw_tree_to_screen(root->node1, minx, miny, maxx, middley);
-		window_draw_tree_to_screen(root->node2, minx, middley+2, maxx, maxy);
-
-		// print connecting borders
-		if (middley+1 >= term.row)
-			return;
-		if (minx-1 >= 0 && minx-1 < term.col) {
-			if (term.line[middley+1][minx-1].u == L'┬' ||
-				term.line[middley+1][minx-1].u == L'┴' ||
-				term.line[middley+1][minx-1].u == L'├' ||
-				term.line[middley+1][minx-1].u == L'┤')
-				tsetchar(L'┼', minx-1, middley+1);
-			if (term.line[middley+1][minx-1].u == L'│')
-				tsetchar(L'├', minx-1, middley+1);
-		}
-		if (maxx+1 >= 0 && maxx+1 < term.col) {
-			if (term.line[middley+1][maxx+1].u == L'┤')
-			if (term.line[middley+1][maxx+1].u == L'┬' ||
-				term.line[middley+1][maxx+1].u == L'┴' ||
-				term.line[middley+1][maxx+1].u == L'├' ||
-				term.line[middley+1][maxx+1].u == L'┤')
-				tsetchar(L'┼', maxx+1, middley+1);
-			if (term.line[middley+1][maxx+1].u == L'│')
-				tsetchar(L'┤', maxx+1, middley+1);
-		}
-		for (int y = middley+1; y < middley+2; y++)
-			xdrawline(term.line[y], minx, y, maxx+1);
+		window_draw_tree_to_screen(root->node2, minx, middley, maxx, maxy);
 	}
 }
 
@@ -654,9 +696,11 @@ file_path_get_path(const char* path)
 }
 
 int
-file_browser_next_item(DIR* dir, const char* path, const char* search, char* full_path, char* filename)
+file_browser_next_item(DIR* dir, const char* path, const char* search, char* full_path, char* filename, int* offset)
 {
+	static char filename_search[PATH_MAX];
 	assert(path);
+	assert(search);
 	assert(dir);
 	assert(strlen(path) < PATH_MAX+1);
 	int len = strlen(search);
@@ -668,19 +712,39 @@ file_browser_next_item(DIR* dir, const char* path, const char* search, char* ful
 		strcat(full_path, filename);
 		if (path_is_folder(full_path))
 			strcat(filename, "/");
+		strcpy(filename_search, filename);
 
-		if (memcmp(filename, search, len) == 0) {
-			if (search[0] != '.' && folder->d_name[0] == '.')
-				continue;
-			if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0)
-				continue;
-			return 1;
+		const char* s_repl = search;
+		while(!isupper(*s_repl++)) {
+			if (*s_repl == 0) {
+				for (char* fs = filename_search; *fs; fs++)
+					*fs = tolower(*fs);
+				break;
+			}
+		}
+
+		int f_len = strlen(filename_search);
+		char* search_start = filename_search;
+		if (!*search)
+			goto search_match;
+		while((search_start = memchr(search_start, *search, f_len))) {
+			if (memcmp(search_start, search, len) == 0) {
+				search_match:
+				if (search[0] != '.' && folder->d_name[0] == '.')
+					break;
+				if (strcmp(filename_search, "./") == 0 || strcmp(filename, "../") == 0)
+					break;
+				*offset = search_start - filename_search;
+				return 1;
+			}
+			search_start++;
 		}
 	}
 	*filename = *full_path = 0;
 	return 0;
 }
 
+//TODO: generalise and reuse for other searching applications
 void
 draw_dir(const char* path, const char* search, int* sel, int minx, int miny, int maxx, int maxy, int focused)
 {
@@ -689,6 +753,8 @@ draw_dir(const char* path, const char* search, int* sel, int minx, int miny, int
 	assert(path);
 	assert(sel);
 
+
+	// change background color
 	global_attr.bg = alternate_bg_dark;
 	tsetregion(minx, miny+1, maxx, maxy, ' ');
 	global_attr = default_attributes;
@@ -696,36 +762,41 @@ draw_dir(const char* path, const char* search, int* sel, int minx, int miny, int
 	int len = strlen(search);
     DIR *dir = opendir(path);
 
+	// count folders to get scroll
 	int folder_lines = maxy - miny - 1;
 	int folders = 0;
-    while(file_browser_next_item(dir, path, search, full_path, filename))
+	int tmp_offset;
+    while(file_browser_next_item(dir, path, search, full_path, filename, &tmp_offset))
 		folders++;
-
 	rewinddir(dir);
 	*sel = MIN(*sel, folders-1);
 	int sel_local = *sel;
+
+	// print num of files
 	char count[256];
 	if (sel_local > folder_lines)
-		snprintf(count, 256, "^[%2d] ", folders);
-	else if (folders > folder_lines)
-		snprintf(count, 256, "ˇ[%2d] ", folders);
+		snprintf(count, sizeof(count), "^[%2d] ", folders);
+	else if (folders-1 > folder_lines)
+		snprintf(count, sizeof(count), "ˇ[%2d] ", folders);
 	else
-		snprintf(count, 256, " [%2d] ", folders);
+		snprintf(count, sizeof(count), " [%2d] ", folders);
 
+	// print current input, where the folder path not in the search
+	// is path_color while the search is default
 	global_attr.fg = path_color;
 	int new_x = write_string(count, miny, minx, maxx+1);
 	new_x = write_string(path, miny, new_x, maxx+1);
-
 	global_attr = default_attributes;
 	new_x = write_string(search, miny, new_x, maxx+1);
 
-	global_attr = default_attributes;
-	global_attr.bg = alternate_bg_dark;
-
+	// print folders
 	int start_miny = miny;
+	int offset;
 	folders--;
 	miny++;
-    while(miny < maxy && file_browser_next_item(dir, path, search, full_path, filename)) {
+    while(miny <= maxy && file_browser_next_item(dir, path, search, full_path, filename, &offset)) {
+		global_attr = default_attributes;
+		global_attr.bg = alternate_bg_dark;
 		if (path_is_folder(full_path))
 			global_attr.fg = path_color;
 		else
@@ -736,19 +807,20 @@ draw_dir(const char* path, const char* search, int* sel, int minx, int miny, int
 			sel_local--;
 			continue;
 		}
-
 		write_string(filename, miny, minx, maxx+1);
-		for (int i = minx; i < minx + len; i++)
-			term.line[miny][i].fg = highlight_color;
+
+		// change the color to highlight search term
+		for (int i = minx + offset; i < minx + len + offset && i < maxx; i++)
+			tsetattr(i, miny)->fg = highlight_color;
+		// change the background of the selected line
 		if (miny - start_miny - 1 == sel_local)
 			for (int i = minx; i < maxx+1; i++)
-				term.line[miny][i].bg = selection_bg;
+				tsetattr(i, miny)->bg = selection_bg;
 		miny++;
 	}
-	miny = MIN(miny, maxy);
 	closedir(dir);
 
-
+	// print message if the file doesn't exist, error trying to make folder
 	if (folders < 0) {
 		global_attr = default_attributes;
 		if (search[strlen(search)-1] == '/')
@@ -758,8 +830,10 @@ draw_dir(const char* path, const char* search, int* sel, int minx, int miny, int
 		write_string("  [Create New File]", start_miny, new_x, maxx+1);
 	}
 
+	// draw
+
 	for (int y = start_miny; y < maxy+1; y++)
-		xdrawline(term.line[y], minx, y, maxx+1);
+		xdrawline(minx, y, maxx+1);
 
 	xdrawcursor(new_x, start_miny, focused);
 
@@ -779,6 +853,143 @@ void recursive_mkdir(char *path) {
         fprintf(stderr, "error while trying to create '%s'\n%s\n", path, strerror(errno));
 }
 
+int
+writef_string(int y, int x1, int x2, const char* fmt, ...)
+{
+	char string[STATUS_BAR_MAX_LEN];
+
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(string, STATUS_BAR_MAX_LEN, fmt, args);
+	va_end(args);
+
+	return write_string(string, y, x1, x2);
+}
+
+int
+writef_to_status_bar(const char* fmt, ...)
+{
+	static char string[STATUS_BAR_MAX_LEN];
+	if (!fmt)
+		return write_string(string, term.row-1, 0, term.col);
+
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(string, STATUS_BAR_MAX_LEN, fmt, args);
+	va_end(args);
+
+	return write_string(string, term.row-1, 0, term.col);
+}
+
+void
+draw_status_bar()
+{
+	// change background color
+	global_attr = default_attributes;
+	global_attr.bg = alternate_bg_dark;
+	tsetregion(0, term.row-1, term.col-1, term.row-1, ' ');
+	writef_to_status_bar(NULL);
+	global_attr = default_attributes;
+
+	xdrawline(0, term.row-1, term.col);
+	draw_horisontal_line(term.row-2, 0, term.col-1);
+}
+
+void
+buffer_copy_ub_to_current(struct window_buffer* buffer)
+{
+	struct file_buffer* fb = get_file_buffer(buffer);
+	struct undo_buffer* cub = &fb->ub[fb->current_undo_buffer];
+	assert(cub->contents);
+
+	fb->contents = xrealloc(fb->contents, cub->capacity);
+	memcpy(fb->contents, cub->contents, cub->capacity);
+	fb->len = cub->len;
+	fb->capacity = cub->capacity;
+
+	buffer_move_to_offset(buffer, cub->cursor_offset, CURSOR_SNAPPED);
+	buffer->y_scroll = cub->y_scroll;
+}
+
+void
+buffer_undo(struct file_buffer* buf)
+{
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (fb->current_undo_buffer == 0) {
+		writef_to_status_bar("end of undo buffer");
+		return;
+	}
+	fb->current_undo_buffer--;
+	fb->available_redo_buffers++;
+
+	buffer_copy_ub_to_current(focused_window);
+	writef_to_status_bar("undo");
+}
+
+void
+buffer_redo(struct file_buffer* buf)
+{
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (fb->available_redo_buffers == 0) {
+		writef_to_status_bar("end of redo buffer");
+		return;
+	}
+	fb->available_redo_buffers--;
+	fb->current_undo_buffer++;
+
+	buffer_copy_ub_to_current(focused_window);
+	writef_to_status_bar("redo");
+}
+
+void
+buffer_add_to_undo(struct file_buffer* buffer, int offset, enum buffer_content_reason reason)
+{
+	static time_t last_normal_edit;
+	static int edits;
+
+	if (reason == BUFFER_CONTENT_NORMAL_EDIT) {
+		time_t previous_time = last_normal_edit;
+		last_normal_edit = time(NULL);
+
+		if (last_normal_edit - previous_time < 2 && edits < 30) {
+			edits++;
+			goto copy_undo_buffer;
+		} else {
+			edits = 0;
+		}
+	} else if (reason == BUFFER_CONTENT_INIT) {
+		goto copy_undo_buffer;
+	}
+
+	if (buffer->available_redo_buffers > 0) {
+		buffer->available_redo_buffers = 0;
+		buffer->current_undo_buffer++;
+		goto copy_undo_buffer;
+	}
+
+	if (buffer->current_undo_buffer == UNDO_BUFFERS_COUNT-1) {
+		char* begin_buffer = buffer->ub[0].contents;
+		memmove(buffer->ub, &(buffer->ub[1]), (UNDO_BUFFERS_COUNT-1) * sizeof(struct undo_buffer));
+		buffer->ub[buffer->current_undo_buffer].contents = begin_buffer;
+	} else {
+		buffer->current_undo_buffer++;
+	}
+
+copy_undo_buffer: ;
+	struct undo_buffer* cub = &buffer->ub[buffer->current_undo_buffer];
+
+	cub->contents = xrealloc(cub->contents, buffer->capacity);
+	memcpy(cub->contents, buffer->contents, buffer->capacity);
+	cub->len = buffer->len;
+	cub->capacity = buffer->capacity;
+	cub->cursor_offset = offset;
+	if (focused_window)
+		cub->y_scroll = focused_window->y_scroll;
+	else
+		cub->y_scroll = 0;
+}
+
+
 struct file_buffer
 buffer_new(const char* file_path)
 {
@@ -795,6 +1006,7 @@ buffer_new(const char* file_path)
 		fclose(new_file);
 
 		realpath(file_path, buffer.file_path);
+		writef_to_status_bar("created new file %s", buffer.file_path);
 	}
 
 	if (path_is_folder(buffer.file_path)) {
@@ -839,6 +1051,8 @@ buffer_new(const char* file_path)
 	if (buffer_contents_updated)
 		buffer_contents_updated(&buffer, 0, BUFFER_CONTENT_INIT);
 
+	if (res)
+		writef_to_status_bar("new buffer %s", buffer.file_path);
 	return buffer;
 }
 
@@ -988,8 +1202,8 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 
 	LIMIT(maxx, 0, term.col-1);
 	LIMIT(maxy, 0, term.row-1);
-	LIMIT(minx, 0, maxx-1);
-	LIMIT(miny, 0, maxy-1);
+	LIMIT(minx, 0, maxx);
+	LIMIT(miny, 0, maxy);
 	LIMIT(buf->cursor_offset, 0, fb->len);
 	tsetregion(minx, miny, maxx, maxy, ' ');
 
@@ -1005,17 +1219,9 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 		return;
 	}
 
-	int color_scheme_available = -1;
-	for (int i = 0; color_schemes[i].file_ending; i++) {
-		if (is_file_type(fb->file_path, color_schemes[i].file_ending)) {
-			color_scheme_available = i;
-			break;
-		}
-	}
-
 	int x = minx, y = miny;
 	global_attr = default_attributes;
-	do_color_scheme(NULL, (struct color_scheme){0}, 0);
+	do_color_scheme(NULL, &(struct color_scheme){0}, 0);
 
 	// force the screen in a place where the cursor is visable
 	int ox, oy;
@@ -1027,7 +1233,7 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 	if (oy < 0) {
 		buf->y_scroll += oy;
 	} else {
-		oy += miny - maxy;
+		oy += miny - maxy+2;
 		if (oy > 0)
 			buf->y_scroll += oy;
 	}
@@ -1053,25 +1259,27 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 	int offset_start = repl - fb->contents;
 	int cursor_x = 0, cursor_y = 0;
 
+	const struct color_scheme* cs = buffer_get_color_scheme(fb);
+
 	// search backwards to find multi-line syntax highlighting
-	if (color_scheme_available >= 0) {
-		for (int i = 0; i < color_schemes[color_scheme_available].entry_count; i++) {
-			const struct color_scheme_entry cs = color_schemes[color_scheme_available].entries[i];
-			if (cs.mode == COLOR_AROUND || cs.mode == COLOR_INSIDE) {
+	if (cs) {
+		for (int i = 0; i < cs->entry_count; i++) {
+			const struct color_scheme_entry cse = cs->entries[i];
+			if (cse.mode == COLOR_AROUND || cse.mode == COLOR_INSIDE) {
 				int offset = 0;
 				int count = 0;
-				int start_len = strlen(cs.arg.start);
-				while((offset = buffer_seek_string(fb, offset, cs.arg.start)) >= 0) {
+				int start_len = strlen(cse.arg.start);
+				while((offset = buffer_seek_string(fb, offset, cse.arg.start)) >= 0) {
 					offset += start_len;
 					if (offset >= offset_start)
 						break;
 					count++;
 				}
 
-				if (strcmp(cs.arg.start, cs.arg.end) != 0) {
-					int end_len = strlen(cs.arg.end);
+				if (strcmp(cse.arg.start, cse.arg.end) != 0) {
+					int end_len = strlen(cse.arg.end);
 					offset = 0;
-					while((offset = buffer_seek_string(fb, offset, cs.arg.end)) >= 0) {
+					while((offset = buffer_seek_string(fb, offset, cse.arg.end)) >= 0) {
 						offset += end_len;
 						if (offset >= offset_start)
 							break;
@@ -1079,8 +1287,8 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 					}
 				}
 				if (count > 0) {
-					offset = buffer_seek_string_backwards(fb, offset_start, cs.arg.start);
-					do_color_scheme(fb, color_schemes[color_scheme_available], offset);
+					offset = buffer_seek_string_backwards(fb, offset_start, cse.arg.start);
+					do_color_scheme(fb, cs, offset);
 					break;
 				}
 			}
@@ -1099,8 +1307,8 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 			LIMIT(cursor_y, miny, maxy);
 		}
 
-		if (color_scheme_available >= 0)
-			do_color_scheme(fb, color_schemes[color_scheme_available], repl - fb->contents);
+		if (cs)
+			do_color_scheme(fb, cs, repl - fb->contents);
 
 		if (!wrap_buffer && x - xscroll > maxx && *repl != '\n') {
 			charsize = 1;
@@ -1110,7 +1318,7 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 
 		if (*repl == '\n' || (wrap_buffer && x >= maxx)) {
 			x = minx;
-			if (++y > maxy)
+			if (++y >= maxy-1)
 				break;
 			if (wrap_buffer && *repl != '\n')
 				continue;
@@ -1118,12 +1326,12 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 			continue;
 		} else if (*repl == '\t') {
 			charsize = 1;
-			if (x <= 0) {
+			if ((x - minx) <= 0) {
 				x += tsetchar(' ', x - xscroll, y);
 				if (x >= maxx)
 					continue;
 			}
-			while (x % tabspaces != 0 && x - xscroll <= maxx)
+			while ((x - minx) % tabspaces != 0 && x - xscroll <= maxx)
 				x += tsetchar(' ', x - xscroll, y);
 
 			if (x - xscroll <= maxx)
@@ -1143,30 +1351,48 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 		x += width;
 	}
 	int offset_end = repl - fb->contents;
+	global_attr = default_attributes;
 
 	if (buf->cursor_offset >= fb->len) {
 		cursor_x = x - xscroll;
-		cursor_y = y;
+		cursor_y = MIN(y, maxy);
 	}
 
 	if(buffer_written_to_screen_callback)
 		buffer_written_to_screen_callback(buf, offset_start, offset_end, minx, miny, maxx, maxy);
 
-	if (buf == focused_window)
-		for (int i = minx; i < maxx+1; i++)
-			term.line[cursor_y][i].bg = mouse_line_bg;
+	// TODO: let the user do this
+	int status_end = writef_string(maxy-1, minx, maxx+1, "   %dk  %s  %d:%d %d%%",
+								   fb->len/1000, fb->file_path, cursor_y + buf->y_scroll, cursor_x,
+								   (int)(((float)(buf->cursor_offset+1)/(float)fb->len)*100.0f));
+	if (fb->mode & BUFFER_SELECTION_ON) {
+		int y1, y2, tmp;
+		buffer_offset_to_xy(buf, fb->s1o, 0, &tmp, &y1);
+		buffer_offset_to_xy(buf, fb->s2o, 0, &tmp, &y2);
+		writef_string(maxy-1, status_end, maxx, " %dL", abs(y1-y2));
+	}
+
+	if (buf == focused_window) {
+		for (int i = minx; i < maxx+1; i++) {
+			if (!(fb->mode & BUFFER_SELECTION_ON))
+				tsetattr(i, cursor_y)->bg = mouse_line_bg;
+			tsetattr(i, maxy-1)->bg = alternate_bg_bright;
+		}
+	}
 
 	buffer_write_selection(buf, minx, miny, maxx, maxy);
-	do_color_scheme(NULL, (struct color_scheme){0}, 0);
+	do_color_scheme(NULL, &(struct color_scheme){0}, 0);
 
-	for (int i = miny; i < maxy+1; i++)
-		xdrawline(term.line[i], minx, i, maxx+1);
+	for (int i = miny; i < maxy; i++)
+		xdrawline(minx, i, maxx+1);
 
+	draw_horisontal_line(maxy-1, minx, maxx);
 	xdrawcursor(cursor_x, cursor_y, buf == focused_window);
 }
 
+// TODO: Scope checks (with it's own system, so that it can be used for auto indent as well)
 void
-do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
+do_color_scheme(struct file_buffer* fb, const struct color_scheme* cs, int offset)
 {
 	static int end_at_whitespace = 0;
 	static const char* end_condition;
@@ -1175,7 +1401,7 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 	static int color_next_word = 0;
 	static int around = 0;
 
-	if (!fb) {
+	if (!fb || !cs) {
 		// reset
 		end_at_whitespace = 0;
 		end_condition_len = 0;
@@ -1199,14 +1425,13 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 			end_condition = NULL;
 			end_at_whitespace = 0;
 			global_attr = default_attributes;
-		} else if (memcmp(buf + offset, end_condition, end_condition_len) == 0) {
-			// end word mathces
+		} else if (buffer_offset_starts_with(fb, offset, end_condition)) {
 			if (isspace(end_condition[end_condition_len-1])) {
 				end_condition_len--;
 				if (end_condition_len <= 0)
 					global_attr = default_attributes;
 			}
-			// if it's around not inside, don't reset color
+			// if it's around not inside, don't reset color until later
 			if (around)
 				around = 0;
 			 else
@@ -1217,7 +1442,7 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 		}
 		return;
 	} else if (end_at_whitespace) {
-		if (str_contains_char(cs.word_seperators, buf[offset])) {
+		if (!buffer_is_on_a_word(fb, offset, cs->word_seperators)) {
 			end_at_whitespace = 0;
 			global_attr = default_attributes;
 		} else {
@@ -1225,7 +1450,7 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 		}
 	} else if (color_next_word) {
 		// check if new word encountered
-		if (str_contains_char(cs.word_seperators, buf[offset]))
+		if (!buffer_is_on_a_word(fb, offset, cs->word_seperators))
 			return;
 		global_attr = next_word_attr;
 		color_next_word = 0;
@@ -1240,24 +1465,24 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 			return;
 	}
 
-	for (int i = 0; i < cs.entry_count; i++) {
-		struct color_scheme_entry entry = cs.entries[i];
+	for (int i = 0; i < cs->entry_count; i++) {
+		struct color_scheme_entry entry = cs->entries[i];
 		enum color_scheme_mode mode = entry.mode;
 
 		if (mode == COLOR_UPPER_CASE_WORD) {
-			// check if this is a new word
-			if (str_contains_char(cs.word_seperators, buf[offset])) continue;
+			if (!buffer_is_start_of_a_word(fb, offset, cs->word_seperators))
+				continue;
 
-			// check if it's upper case
 			int end_len = 0;
-			while (offset + end_len < fb->len && !str_contains_char(cs.word_seperators, buf[offset + end_len])) {
+			while (offset + end_len < fb->len && !str_contains_char(cs->word_seperators, buf[offset + end_len])) {
 				if (!isupper(buf[offset + end_len]) && buf[offset + end_len] != '_'
 					&& (!end_len || (buf[offset + end_len] < '0' || buf[offset + end_len] > '9')))
 					goto not_upper_case;
 				end_len++;
 			}
-			// upper case words must be longer than x chars
-			if (end_len < 3) continue;
+			// upper case words must be longer than UPPER_CASE_WORD_MIN_LEN chars
+			if (end_len < UPPER_CASE_WORD_MIN_LEN)
+				continue;
 
 			global_attr = entry.attr;
 			end_condition_len = end_len;
@@ -1271,7 +1496,7 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 
 		if (mode == COLOR_WORD_BEFORE_STR || mode == COLOR_WORD_BEFORE_STR_STR || mode == COLOR_WORD_ENDING_WITH_STR) {
 			// check if this is a new word
-			if (str_contains_char(cs.word_seperators, buf[offset])) continue;
+			if (str_contains_char(cs->word_seperators, buf[offset])) continue;
 
 			int offset_tmp = offset;
 			// find new word twice if it's BEFORE_STR_STR
@@ -1280,34 +1505,24 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 			int first_time = 1;
 			while (times--) {
 				// seek end of word
-				int chars = 0;
-				while (offset_tmp < fb->len && !str_contains_char(cs.word_seperators, buf[offset_tmp])) {
-					if (buf[offset_tmp] != '*')
-						chars++;
-					offset_tmp++;
-				}
-				if (!chars && mode == COLOR_WORD_BEFORE_STR_STR)
+				offset_tmp = buffer_seek_word_end(fb, offset_tmp, cs->word_seperators);
+				if (offset_tmp == offset && mode == COLOR_WORD_BEFORE_STR_STR)
 					goto exit_word_before_str_str;
 				if (first_time)
-					first_word_len = chars;
+					first_word_len = offset_tmp - offset;
 
-				// seek start of word
-				if (mode != COLOR_WORD_ENDING_WITH_STR) {
-					int whiespaces = 0;
-					while (offset_tmp < fb->len && (isspace(buf[offset_tmp]) || buf[offset_tmp] == '*')) {
-						offset_tmp++;
-						whiespaces++;
-					}
-				}
+				if (mode != COLOR_WORD_ENDING_WITH_STR)
+					offset_tmp = buffer_seek_not_whitespace(fb, offset_tmp);
+
 				first_time = 0;
 			}
+
 			if (mode == COLOR_WORD_ENDING_WITH_STR) {
 				offset_tmp -= len;
 				if (offset_tmp < 0)
 					continue;
 			}
-			// check if string matches
-			if (memcmp(buf + offset_tmp, entry.arg.start, len) == 0) {
+			if (buffer_offset_starts_with(fb, offset_tmp, entry.arg.start)) {
 				global_attr = entry.attr;
 				end_condition_len = first_word_len;
 				return;
@@ -1320,25 +1535,24 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 			if (offset - len < 0)
 				continue;
 			// check the if what's behind the cursor is the first string
-			if (memcmp(buf + offset - len, entry.arg.start, len) == 0) {
-				assert(entry.arg.end);
-				int end_len = strlen(entry.arg.end);
-				if (offset < fb->len && memcmp(buf + offset, entry.arg.end, end_len) == 0)
+			if (buffer_offset_starts_with(fb, offset - len, entry.arg.start)) {
+				if (offset < fb->len && buffer_offset_starts_with(fb, offset, entry.arg.end))
 					continue;
 
 				if (mode == COLOR_WORD_INSIDE) {
 					// verify that only one word exists inside
 					int offset_tmp = offset;
-					while (offset_tmp < fb->len && isspace(buf[offset_tmp])) offset_tmp++;
-					while (offset_tmp < fb->len && !str_contains_char(cs.word_seperators, buf[offset_tmp])) offset_tmp++;
-					while (offset_tmp < fb->len && isspace(buf[offset_tmp])) offset_tmp++;
-					if (memcmp(buf + offset_tmp, entry.arg.end, end_len) != 0
-						|| offset_tmp - offset <= 1)
+					offset_tmp = buffer_seek_not_whitespace(fb, offset_tmp);
+					offset_tmp = buffer_seek_word_end(fb, offset_tmp, cs->word_seperators);
+					offset_tmp = buffer_seek_not_whitespace(fb, offset_tmp);
+
+					if (!buffer_offset_starts_with(fb, offset_tmp, entry.arg.end) ||
+						offset_tmp - offset <= 1)
 						continue;
 				}
 
 				end_condition = entry.arg.end;
-				end_condition_len = end_len;
+				end_condition_len = strlen(entry.arg.end);
 				global_attr = entry.attr;
 				around = 0;
 				if (entry.mode == COLOR_INSIDE_TO_LINE)
@@ -1348,69 +1562,63 @@ do_color_scheme(struct file_buffer* fb, struct color_scheme cs, int offset)
 			continue;
 		}
 
-		// the rest of the conditions all check if the first string matches
-		if (buflen - offset <= len)
-			continue;
-		if (memcmp(buf + offset, entry.arg.start, len) == 0) {
-			if (mode == COLOR_AROUND || mode == COLOR_AROUND_TO_LINE) {
-				assert(entry.arg.end);
-				end_condition = entry.arg.end;
-				end_condition_len = strlen(entry.arg.end);
-				around = 1;
-				if (entry.mode == COLOR_AROUND_TO_LINE)
-					end_at_whitespace = 1;
-			} else if (mode == COLOR_WORD || mode == COLOR_STR_AFTER_WORD ||
-					   mode == COLOR_WORD_STR || mode == COLOR_WORD_STARTING_WITH_STR) {
+		if ((mode == COLOR_AROUND || mode == COLOR_AROUND_TO_LINE) &&
+			buffer_offset_starts_with(fb, offset, entry.arg.start)) {
+			end_condition = entry.arg.end;
+			end_condition_len = strlen(entry.arg.end);
+			around = 1;
+			if (entry.mode == COLOR_AROUND_TO_LINE)
+				end_at_whitespace = 1;
+			global_attr = entry.attr;
+			return;
+		}
+		if (mode == COLOR_WORD || mode == COLOR_STR_AFTER_WORD ||
+			mode == COLOR_WORD_STR || mode == COLOR_WORD_STARTING_WITH_STR) {
 
-				// check if this is the start of a new word that matches word exactly(except for WORD_STARTING_WITH_STR)
-				if ((offset > 0 && !str_contains_char(cs.word_seperators, buf[offset-1])) ||
-					(buflen - (offset+len) > len && !str_contains_char(cs.word_seperators, buf[offset+len])
-						&& mode != COLOR_WORD_STARTING_WITH_STR))
+			// check if this is the start of a new word that matches word exactly(except for WORD_STARTING_WITH_STR)
+			if(!buffer_offset_starts_with(fb, offset, entry.arg.start) ||
+			   !buffer_is_start_of_a_word(fb, offset, cs->word_seperators) ||
+			   (buffer_is_on_a_word(fb, offset + len, cs->word_seperators) && mode != COLOR_WORD_STARTING_WITH_STR))
+				continue;
+
+			if (mode == COLOR_WORD_STR) {
+				int offset_str = buffer_seek_not_whitespace(fb, offset + len);
+
+				if (!buffer_offset_starts_with(fb, offset_str, entry.arg.end))
 					continue;
-
-				if (mode == COLOR_WORD_STR) {
-					assert(entry.arg.end);
-					int offset_tmp = offset + len;
-					// move to next string
-					while (offset_tmp < fb->len && isspace(fb->contents[offset_tmp]))
-						offset_tmp++;
-
-					int end_len = strlen(entry.arg.end);
-					if (offset_tmp + end_len >= fb->len ||
-						memcmp(buf + offset_tmp, entry.arg.end, end_len) != 0)
-						continue;
-					end_condition_len = offset_tmp - offset;
-				} else {
-					end_at_whitespace = 1;
-				}
-				if (mode == COLOR_STR_AFTER_WORD) {
-					next_word_attr = entry.attr;
-					color_next_word = 1;
-					continue;
-				}
-			} else if (mode == COLOR_STR) {
-				end_condition_len = len;
+				end_condition_len = strlen(entry.arg.start);
+			} else {
+				end_at_whitespace = 1;
 			}
-
-			global_attr= entry.attr;
+			if (mode == COLOR_STR_AFTER_WORD) {
+				next_word_attr = entry.attr;
+				color_next_word = 1;
+				continue;
+			}
+			global_attr = entry.attr;
+			return;
+		}
+		if (mode == COLOR_STR) {
+			if (!buffer_offset_starts_with(fb, offset, entry.arg.start))
+				continue;
+			end_condition_len = len;
+			global_attr = entry.attr;
 			return;
 		}
 	}
 }
 
-
 int
 write_string(const char* string, int y, int minx, int maxx)
 {
 	LIMIT(maxx, 0, term.col);
-	LIMIT(minx, 0, maxx-1);
+	LIMIT(minx, 0, maxx);
 
 	int offset = 0;
 	int len = strlen(string);
 	while(minx < maxx && offset < len) {
 		Rune u;
-		int charsize = t_decode_utf8_buffer(string + offset, len - offset, &u);
-		offset += charsize;
+		offset += t_decode_utf8_buffer(string + offset, len - offset, &u);
 		minx += tsetchar(u, minx, y);
 	}
 	return minx;
@@ -1457,8 +1665,8 @@ buffer_write_selection(struct window_buffer* buf, int minx, int miny, int maxx, 
 
 	LIMIT(maxx, 0, term.col-1);
 	LIMIT(maxy, 0, term.row-1);
-	LIMIT(minx, 0, maxx-1);
-	LIMIT(miny, 0, maxy-1);
+	LIMIT(minx, 0, maxx);
+	LIMIT(miny, 0, maxy);
 
 	//TODO: implement alternative selection modes
 	if (!(fb->mode & BUFFER_SELECTION_ON))
@@ -1478,11 +1686,11 @@ buffer_write_selection(struct window_buffer* buf, int minx, int miny, int maxx, 
 
 	for(; y < y2; y++) {
 		for(; x < maxx; x++)
-			color_selection(&term.line[y][x]);
+			color_selection(tsetattr(x, y));
 		x = 0;
 	}
 	for(; x < x2; x++)
-		color_selection(&term.line[y][x]);
+		color_selection(tsetattr(x, y));
 }
 
 char* buffer_get_selection(struct file_buffer* buffer, int* selection_len)
@@ -1540,6 +1748,7 @@ buffer_write_to_filepath(const struct file_buffer* buffer)
 	if (buffer->mode & BUFFER_UTF8_SIGNED)
 		fwrite("\xEF\xBB\xBF", 1, 3, file);
 	fwrite(buffer->contents, sizeof(char), buffer->len, file);
+	writef_to_status_bar("written buffer to %s", buffer->file_path);
 
 	fclose(file);
 }
@@ -1568,6 +1777,8 @@ tsetchar(Rune u, int x, int y)
 		y < 0         || x < 0)
 		return 1;
 
+	if (u == 0)
+		u = term.line[y][x].u;
 	int width = wcwidth(u);
 	if (width == -1)
 		width = 1;
@@ -1576,10 +1787,10 @@ tsetchar(Rune u, int x, int y)
 
 	if (term.line[y][x].mode & ATTR_WIDE || attr.mode & ATTR_WIDE) {
 		if (x+1 < term.col) {
-			term.line[y][x+1].u = 0;
+			term.line[y][x+1].u = ' ';
 			term.line[y][x+1].mode |= ATTR_WDUMMY;
 		}
-	} else if (term.line[y][x].mode & ATTR_WDUMMY) {
+	} else if (term.line[y][x].mode & ATTR_WDUMMY && x-1 >= 0) {
 		term.line[y][x-1].u = ' ';
 		term.line[y][x-1].mode &= ~ATTR_WIDE;
 	}
@@ -1590,38 +1801,38 @@ tsetchar(Rune u, int x, int y)
 	return width;
 }
 
+Glyph*
+tsetattr(int x, int y)
+{
+	static Glyph dummy;
+	if (y >= term.row || x >= term.col ||
+		y < 0         || x < 0)
+		return &dummy;
+
+	return &term.line[y][x];
+}
+
+Rune
+tgetrune(int x, int y)
+{
+	if (y >= term.row || x >= term.col ||
+		y < 0         || x < 0)
+		return 0;
+	return term.line[y][x].u;
+}
+
 void
 tsetregion(int x1, int y1, int x2, int y2, Rune u)
 {
-	int x, y, temp;
-
-	if (x1 > x2)
-		temp = x1, x1 = x2, x2 = temp;
-	if (y1 > y2)
-		temp = y1, y1 = y2, y2 = temp;
-
-	LIMIT(x1, 0, term.col-1);
-	LIMIT(x2, 0, term.col-1);
-	LIMIT(y1, 0, term.row-1);
-	LIMIT(y2, 0, term.row-1);
-
-	assert(term.line);
-	assert(term.line[0]);
-
-	for (y = y1; y <= y2; y++) {
-		for (x = x1; x <= x2; x++) {
-			term.line[y][x] = global_attr;
-			term.line[y][x].u = u;
-		}
-	}
+	for (int y = y1; y <= y2; y++)
+		for (int x = x1; x <= x2; x++)
+			tsetchar(u, x, y);
 }
 
 void
 tresize(int col, int row)
 {
 	int i;
-	int minrow = MIN(row, term.row);
-	int mincol = MIN(col, term.col);
 
 	if (col < 1 || row < 1) {
 		fprintf(stderr,
@@ -1629,10 +1840,13 @@ tresize(int col, int row)
 		return;
 	}
 
-	/* resize to new height */
-	if (row < term.row)
-		for (i = row; i < term.row; i++)
+	// resize to new height
+	if (row < term.row) {
+		for (i = row; i < term.row; i++) {
 			free(term.line[i]);
+			term.line[i] = NULL;
+		}
+	}
 
 	term.line = xrealloc(term.line, row * sizeof(Line));
 
@@ -1640,19 +1854,13 @@ tresize(int col, int row)
 		for (i = term.row; i < row; i++)
 			term.line[i] = NULL;
 
-	/* resize each row to new width, zero-pad if needed */
+	// resize each row to new width, zero-pad if needed
 	for (i = 0; i < row; i++)
 		term.line[i] = xrealloc(term.line[i], col * sizeof(Glyph));
 
-	/* update terminal size */
+	// update terminal size
 	term.col = col;
 	term.row = row;
-
-	/* Clear screen */
-	if (mincol < col && 0 < minrow)
-		tsetregion(mincol, 0, col - 1, minrow - 1, ' ');
-	if (0 < col && minrow < row)
-		tsetregion(0, minrow, col - 1, row - 1, ' ');
 }
 
 int

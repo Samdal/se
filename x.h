@@ -104,7 +104,7 @@ typedef struct {
 
 void xclipcopy(void);
 void xdrawcursor(int, int, int focused);
-void xdrawline(Line, int, int, int);
+void xdrawline(int, int, int);
 void xfinishdraw(void);
 void xloadcols(void);
 void xloadfonts(const char *, double);
@@ -121,7 +121,11 @@ int match(uint, uint);
 
 struct file_buffer* get_file_buffer(struct window_buffer* buf);
 int new_file_buffer_entry(const char* file_path);
-void destroy_file_buffer_entry(struct window_split_node* node, struct window_split_node* root);
+int destroy_file_buffer_entry(struct window_split_node* node, struct window_split_node* root);
 int delete_selection(struct file_buffer* buf);
+void draw_horisontal_line(int y, int x1, int x2);
+// buffer MUST be malloced and NOT be freed after it is passed
+void set_clipboard_copy(char* buffer, int len);
+void insert_clipboard_at_cursor();
 
 #endif // _X_H
