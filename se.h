@@ -14,7 +14,7 @@
 #define UNDO_BUFFERS_COUNT 32
 #define UPPER_CASE_WORD_MIN_LEN 3
 #define STATUS_BAR_MAX_LEN 4096
-#define SEARCH_TERM_LEN 4096
+#define SEARCH_TERM_MAX_LEN 4096
 
 #define MIN(a, b)		((a) < (b) ? (a) : (b))
 #define MAX(a, b)		((a) < (b) ? (b) : (a))
@@ -200,17 +200,33 @@ struct undo_buffer {
 	int y_scroll;
 };
 
+enum buffer_flags {
+	BUFFER_SELECTION_ON = 1 << 0,
+	BUFFER_BLOCK_SELECT = 1 << 1,
+	BUFFER_LINE_SELECT  = 1 << 2,
+	BUFFER_READ_ONLY    = 1 << 3,
+	BUFFER_UTF8_SIGNED  = 1 << 4,
+	BUFFER_SEARCH_BLOCKING       = 1 << 5,
+	BUFFER_SEARCH_BLOCKING_IDLE  = 1 << 6,
+	BUFFER_SEARCH_BLOCKING_MASK = (BUFFER_SEARCH_BLOCKING | BUFFER_SEARCH_BLOCKING_IDLE),
+	BUFFER_SEARCH_NON_BLOCKING   = 1 << 7,
+	BUFFER_SEARCH_BLOCKING_BACKWARDS   = 1 << 8,
+	BUFFER_SEARCH_NON_BLOCKING_BACKWARDS   = 1 << 9,
+};
+
 // Contents of a file buffer
 struct file_buffer {
 	char* file_path;
 	char* contents; // !! NOT NULL TERMINATED !!
 	int len;
 	int capacity;
-	int mode; // flags
+	enum buffer_flags mode;
 	struct undo_buffer* ub;
 	int current_undo_buffer;
 	int available_redo_buffers;
 	int s1o, s2o; // selection start offset and end offset
+	char* search_term;
+	char* non_blocking_search_term;
 };
 
 const struct color_scheme* buffer_get_color_scheme(struct file_buffer* fb);
@@ -223,6 +239,7 @@ void buffer_write_to_filepath(const struct file_buffer* buffer);
 void buffer_undo(struct file_buffer* buf);
 void buffer_redo(struct file_buffer* buf);
 
+// TODO: string compare that doesn't care if of capitalisation if the search is all lower case
 int buffer_is_on_a_word(const struct file_buffer* fb, int offset, const char* word_seperators);
 int buffer_is_start_of_a_word(const struct file_buffer* fb, int offset, const char* word_seperators);
 int buffer_is_on_word(const struct file_buffer* fb, int offset, const char* word_seperators, const char* word);
@@ -231,6 +248,8 @@ int buffer_seek_char(const struct file_buffer* buf, int offset, char byte);
 int buffer_seek_char_backwards(const struct file_buffer* buf, int offset, char byte);
 int buffer_seek_string(const struct file_buffer* buf, int offset, const char* string);
 int buffer_seek_string_backwards(const struct file_buffer* buf, int offset, const char* string);
+int buffer_seek_string_wrap(const struct window_buffer* wb, int offset, const char* search);
+int buffer_seek_string_wrap_backwards(const struct window_buffer* wb, int offset, const char* search);
 int buffer_seek_word(const struct file_buffer* fb, int offset, const char* word_seperators);
 int buffer_seek_word_end(const struct file_buffer* fb, int offset, const char* word_seperators);
 int buffer_seek_word_backwards(const struct file_buffer* fb, int offset, const char* word_seperators);
@@ -238,6 +257,8 @@ int buffer_seek_whitespace(const struct file_buffer* fb, int offset);
 int buffer_seek_whitespace_backwrads(const struct file_buffer* fb, int offset);
 int buffer_seek_not_whitespace(const struct file_buffer* fb, int offset);
 int buffer_seek_not_whitespace_backwrads(const struct file_buffer* fb, int offset);
+
+int buffer_count_string_instances(const struct file_buffer* fb, const char* string, int offset, int* before_offset);
 
 ///////////////////////////////////
 // returns a null terminated string containing the selection
@@ -260,6 +281,7 @@ int file_browser_next_item(DIR* dir, const char* path, const char* search, char*
 int write_string(const char* string, int y, int minx, int maxx);
 int writef_to_status_bar(const char* fmt, ...);
 void draw_status_bar();
+void remove_utf8_string_end(char* string);
 
 // Internal representation of the screen
 typedef struct {
@@ -288,13 +310,5 @@ enum buffer_content_reason {
 };
 
 void buffer_add_to_undo(struct file_buffer* buffer, int offset, enum buffer_content_reason reason);
-
-enum buffer_flags {
-	BUFFER_SELECTION_ON = 1 << 0,
-	BUFFER_BLOCK_SELECT = 1 << 1,
-	BUFFER_LINE_SELECT = 1 << 2,
-	BUFFER_READ_ONLY    = 1 << 3,
-	BUFFER_UTF8_SIGNED  = 1 << 4,
-};
 
 #endif // _ST_H
