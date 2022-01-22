@@ -80,6 +80,7 @@ static int file_browser_actions(KeySym keysym, int modkey);
 static void file_browser_string_insert(const char* buf, int buflen);
 static int search_term_actions(KeySym keysym, int modkey);
 static void search_term_string_insert(const char* buf, int buflen);
+static int open_seproj(struct file_buffer fb);
 static int xmakeglyphfontspecs(XftGlyphFontSpec *, const Glyph *, int, int, int);
 static void xdrawglyphfontspecs(const XftGlyphFontSpec *, Glyph, int, int, int);
 static void xdrawglyph(Glyph, int, int);
@@ -170,6 +171,13 @@ get_file_buffer(struct window_buffer* buf)
 		buf->buffer_index = 0;
 
 	if (!file_buffers[buf->buffer_index].contents) {
+		for(int n = buf->buffer_index; n < available_buffer_slots; n++) {
+			if (file_buffers[n].contents) {
+				buf->buffer_index = n;
+				assert(file_buffers[n].contents);
+				return &file_buffers[n];
+			}
+		}
 		for(int n = 0; n < available_buffer_slots; n++) {
 			if (file_buffers[n].contents) {
 				buf->buffer_index = n;
@@ -183,7 +191,38 @@ get_file_buffer(struct window_buffer* buf)
 	}
 
 	buf->buffer_index = new_file_buffer_entry(NULL);
+	writef_to_status_bar("all buffers were somehow deleted, creating new one");
 	return get_file_buffer(buf);
+}
+
+
+int
+open_seproj(struct file_buffer fb)
+{
+	int first = -1;
+
+	char* path = file_path_get_path(fb.file_path);
+	chdir(path);
+
+	int offset = -1;
+	while((offset = buffer_seek_char(&fb, offset+1, '\n')) >= 0) {
+		char* line = buffer_get_line_at_offset(&fb, offset);
+		if (strlen(line) && !is_file_type(line, ".seproj")) {
+			if (first < 0)
+				first = new_file_buffer_entry(line);
+			else
+				new_file_buffer_entry(line);
+		}
+		free(line);
+	}
+
+	if (first < 0)
+		first = new_file_buffer_entry("/home/halvard/Code/C/se/se.c");
+	writef_to_status_bar("opened project %s", path);
+	free(path);
+
+	buffer_destroy(&fb);
+	return first;
 }
 
 int
@@ -195,6 +234,7 @@ new_file_buffer_entry(const char* file_path)
 	assert(strlen(file_path) < PATH_MAX);
 
 	char* res = realpath(file_path, full_path);
+
 	if (available_buffer_slots) {
 		if (res) {
 			for(int n = 0; n < available_buffer_slots; n++) {
@@ -211,15 +251,21 @@ new_file_buffer_entry(const char* file_path)
 
 		for(int n = 0; n < available_buffer_slots; n++) {
 			if (!file_buffers[n].contents) {
+				if (is_file_type(full_path, ".seproj"))
+					return open_seproj(buffer_new(full_path));
 				file_buffers[n] = buffer_new(full_path);
 				return n;
 			}
 		}
 	}
 
+	if (is_file_type(full_path, ".seproj"))
+		return open_seproj(buffer_new(full_path));
+
 	available_buffer_slots++;
 	file_buffers = xrealloc(file_buffers, sizeof(struct file_buffer) * available_buffer_slots);
 	file_buffers[available_buffer_slots-1] = buffer_new(full_path);
+
 	return available_buffer_slots-1;
 }
 
@@ -1382,7 +1428,6 @@ int
 file_browser_actions(KeySym keysym, int modkey)
 {
 	static char full_path[PATH_MAX];
-	static char filename[PATH_MAX];
 	struct file_buffer* fb = get_file_buffer(focused_window);
 	int offset = fb->len;
 
@@ -1410,12 +1455,13 @@ file_browser_actions(KeySym keysym, int modkey)
 		buffer_change(fb, "\0", 1, fb->len, 1);
 		if (fb->len > 0) fb->len--;
 
-		DIR *dir = opendir(path);
-		int tmp;
-		for (int y = 0; file_browser_next_item(dir, path, fb->contents, full_path, filename, &tmp); y++) {
+		file_browser_next_item(NULL, NULL, NULL, NULL);
+		const char* filename;
+		for (int y = 0; (filename = file_browser_next_item(path, fb->contents, NULL, NULL)); y++) {
+			strcpy(full_path, path);
+			strcat(full_path, filename);
 			if (y == focused_window->y_scroll) {
 				if (path_is_folder(full_path)) {
-					strcat(full_path, "/");
 					strcpy(fb->file_path, full_path);
 
 					fb->len = 0;
@@ -1424,7 +1470,8 @@ file_browser_actions(KeySym keysym, int modkey)
 					focused_window->y_scroll = 0;
 
 					free(path);
-					closedir(dir);
+					file_browser_next_item(NULL, NULL, NULL, NULL);
+					*full_path = 0;
 					return 1;
 				}
 				goto open_file;
@@ -1433,7 +1480,7 @@ file_browser_actions(KeySym keysym, int modkey)
 
 		if (fb->contents[fb->len-1] == '/') {
 			free(path);
-			closedir(dir);
+			*full_path = 0;
 			return 1;
 		}
 
@@ -1444,7 +1491,7 @@ open_file:
 		destroy_file_buffer_entry(focused_node, &root_node);
 		focused_node->window = window_buffer_new(new_fb);
 		free(path);
-		closedir(dir);
+		*full_path = 0;
 		return 1;
 	}
 	case XK_Down:
@@ -1735,7 +1782,11 @@ main(int argc, char *argv[])
 	tnew(cols, rows);
 	xinit(cols, rows);
 	xsetenv();
+	// TODO: fix things when the file buffer is empty
+	// for example on a new file
 
+	*focused_window = window_buffer_new(new_file_buffer_entry(".seproj"));
+	/*
 	if (argc <= 1) {
 		*focused_window = window_buffer_new(new_file_buffer_entry(NULL));
 	} else  {
@@ -1747,13 +1798,14 @@ main(int argc, char *argv[])
 				if (master_stack < 0) {
 					window_node_split(focused_node, 0.5, WINDOW_HORISONTAL);
 					master_stack = 0;
-				} else if (master_stack) {
+				} else if (master_stack > 0) {
 					*focused_window = window_buffer_new(new_file_buffer_entry(argv[i]));
 					master_stack = -1;
 					continue;
 				} else {
 					window_node_split(focused_node, 0.5, WINDOW_VERTICAL);
 				}
+
 				if (focused_node->node2) {
 					focused_node = focused_node->node2;
 					focused_window = &focused_node->window;
@@ -1764,6 +1816,7 @@ main(int argc, char *argv[])
 			}
 		}
 	}
+	*/
 
 	static const char* const welcome[] = {"Welcome to se!", "Good day, Human", "Happy Coding", "se: the Simple Editor",
 		"Time to get some progress done!", "Ready for combat", "Initialising...Done",  "loaded in %%d seconds",
