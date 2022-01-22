@@ -259,6 +259,42 @@ buffer_seek_string_backwards(const struct file_buffer* buf, int offset, const ch
 }
 
 int
+buffer_seek_string_wrap(const struct window_buffer* wb, int offset, const char* search)
+{
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (*search == 0 || !buffer_count_string_instances(fb, search, 0, NULL)) {
+		writef_to_status_bar("no results for \"%s\"", search);
+		return -1;
+	}
+	int new_offset = buffer_seek_string(fb, offset, search);
+	if (new_offset < 0) {
+		new_offset = buffer_seek_string(fb, 0, search);
+		writef_to_status_bar("search wrapped");
+	}
+	if (!(fb->mode & BUFFER_SEARCH_BLOCKING))
+		fb->mode |= BUFFER_SEARCH_BLOCKING_IDLE;
+	return new_offset;
+}
+
+int
+buffer_seek_string_wrap_backwards(const struct window_buffer* wb, int offset, const char* search)
+{
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (*search == 0 || !buffer_count_string_instances(fb, search, 0, NULL)) {
+		writef_to_status_bar("no results for \"%s\"", search);
+		return -1;
+	}
+	int new_offset = buffer_seek_string_backwards(fb, offset, search);
+	if (new_offset < 0) {
+		new_offset = buffer_seek_string_backwards(fb, fb->len, search);
+		writef_to_status_bar("search wrapped");
+	}
+	if (!(fb->mode & BUFFER_SEARCH_BLOCKING))
+		fb->mode |= BUFFER_SEARCH_BLOCKING_IDLE;
+	return new_offset;
+}
+
+int
 buffer_is_on_a_word(const struct file_buffer* fb, int offset, const char* word_seperators)
 {
 	LIMIT(offset, 0, fb->len);
@@ -348,6 +384,31 @@ buffer_seek_not_whitespace_backwrads(const struct file_buffer* fb, int offset)
 	LIMIT(offset, 0, fb->len);
 	while (offset > 0 && isspace(fb->contents[offset])) offset--;
 	return offset;
+}
+
+int
+buffer_count_string_instances(const struct file_buffer* fb, const char* string, int offset, int* before_offset)
+{
+	int tmp;
+	if (!before_offset)
+		before_offset = &tmp;
+	if (*fb->search_term == 0) {
+		*before_offset = 0;
+		return 0;
+	}
+
+	int pos = 0;
+	int count = 0;
+	int once = 1;
+	while((pos = buffer_seek_string(fb, pos, string)) >= 0) {
+		count++;
+		pos++;
+		if (once && pos > offset) {
+			*before_offset = count;
+			once = 0;
+		}
+	}
+	return count;
 }
 
 void
@@ -888,11 +949,13 @@ draw_status_bar()
 	global_attr = default_attributes;
 	global_attr.bg = alternate_bg_dark;
 	tsetregion(0, term.row-1, term.col-1, term.row-1, ' ');
-	writef_to_status_bar(NULL);
+	int x_end = writef_to_status_bar(NULL);
 	global_attr = default_attributes;
 
 	xdrawline(0, term.row-1, term.col);
 	draw_horisontal_line(term.row-2, 0, term.col-1);
+	if (get_file_buffer(focused_window)->mode & BUFFER_SEARCH_BLOCKING)
+		xdrawcursor(x_end, term.row-1, 1);
 }
 
 void
@@ -1046,7 +1109,11 @@ buffer_new(const char* file_path)
 	}
 
 	buffer.ub = xmalloc(sizeof(struct undo_buffer) * UNDO_BUFFERS_COUNT);
+	buffer.search_term = xmalloc(SEARCH_TERM_MAX_LEN);
+	buffer.non_blocking_search_term = xmalloc(SEARCH_TERM_MAX_LEN);
 	memset(buffer.ub, 0, sizeof(struct undo_buffer) * UNDO_BUFFERS_COUNT);
+	memset(buffer.search_term, 0, SEARCH_TERM_MAX_LEN);
+	memset(buffer.non_blocking_search_term, 0, SEARCH_TERM_MAX_LEN);
 
 	if (buffer_contents_updated)
 		buffer_contents_updated(&buffer, 0, BUFFER_CONTENT_INIT);
@@ -1062,6 +1129,8 @@ buffer_destroy(struct file_buffer* fb)
 	free(fb->ub);
 	free(fb->contents);
 	free(fb->file_path);
+	free(fb->search_term);
+	free(fb->non_blocking_search_term);
 	*fb = (struct file_buffer){0};
 }
 
@@ -1130,6 +1199,32 @@ buffer_remove(struct file_buffer* buf, const int offset, int len, int do_not_cal
 	if (buffer_contents_updated && !do_not_callback)
 		buffer_contents_updated(buf, offset, BUFFER_CONTENT_NORMAL_EDIT);
 	return removed_len;
+}
+
+void
+remove_utf8_string_end(char* string)
+{
+	int line_start = 0;
+
+	int len = strlen(string);
+	if (len <= 0)
+		return;
+	int move;
+	int seek_pos = line_start, follower_pos = line_start;
+	int n = 0;
+	while (seek_pos < len) {
+		Rune u;
+		int charsize = t_decode_utf8_buffer(string + seek_pos, len - seek_pos, &u);
+		seek_pos += charsize;
+		if (!n) {
+			move = charsize;
+			n = 1;
+		} else {
+			follower_pos += move;
+			move = charsize;
+		}
+	}
+	string[follower_pos] = 0;
 }
 
 int
@@ -1206,6 +1301,7 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 	LIMIT(miny, 0, maxy);
 	LIMIT(buf->cursor_offset, 0, fb->len);
 	tsetregion(minx, miny, maxx, maxy, ' ');
+	int focused = buf == focused_window && !(fb->mode & BUFFER_SEARCH_BLOCKING);
 
 	if (buf->mode == WINDOW_BUFFER_FILE_BROWSER) {
 		char* folder = file_path_get_path(fb->file_path);
@@ -1213,7 +1309,7 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 		buffer_change(fb, "\0", 1, fb->len, 1);
 		if (fb->len > 0) fb->len--;
 
-		draw_dir(folder, fb->contents, &buf->y_scroll, minx, miny, maxx, maxy, buf == focused_window);
+		draw_dir(folder, fb->contents, &buf->y_scroll, minx, miny, maxx, maxy, focused);
 
 		free(folder);
 		return;
@@ -1297,6 +1393,8 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 
 	// actually write to the screen
 	int once = 0;
+	int search_found = 0;
+	int non_blocking_search_found = 0;
 	for (int charsize = 1; repl < last && charsize; repl += charsize) {
 		if (!once && repl - fb->contents >= buf->cursor_offset) {
 			// if the buffer being drawn is focused, set the cursor position global
@@ -1348,6 +1446,26 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 		else
 			width = wcwidth(u);
 
+		// drawing search highlight
+		if (fb->mode & BUFFER_SEARCH_BLOCKING_MASK) {
+			if (!search_found && buffer_offset_starts_with(fb, repl - fb->contents, fb->search_term))
+				search_found = strlen(fb->search_term);
+			if (search_found) {
+				tsetattr(x - xscroll, y)->bg = highlight_color;
+				tsetattr(x - xscroll, y)->fg = default_attributes.bg;
+				search_found--;
+			}
+		}
+		if (fb->mode & BUFFER_SEARCH_NON_BLOCKING) {
+			if (!non_blocking_search_found && buffer_offset_starts_with(fb, repl - fb->contents, fb->non_blocking_search_term))
+				non_blocking_search_found = strlen(fb->search_term);
+			if (non_blocking_search_found) {
+				tsetattr(x - xscroll, y)->fg = highlight_color;
+				tsetattr(x - xscroll, y)->mode |= ATTR_UNDERLINE;
+				non_blocking_search_found--;
+			}
+		}
+
 		x += width;
 	}
 	int offset_end = repl - fb->contents;
@@ -1362,7 +1480,13 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 		buffer_written_to_screen_callback(buf, offset_start, offset_end, minx, miny, maxx, maxy);
 
 	// TODO: let the user do this
-	int status_end = writef_string(maxy-1, minx, maxx+1, "   %dk  %s  %d:%d %d%%",
+	int status_end = minx;
+	if (fb->mode & BUFFER_SEARCH_BLOCKING_IDLE) {
+		int before;
+		int search_count = buffer_count_string_instances(fb, fb->search_term, focused_window->cursor_offset, &before);
+		status_end = writef_string(maxy-1, status_end, maxx+1, " %d/%d", before, search_count);
+	}
+	status_end = writef_string(maxy-1, status_end, maxx+1, " %dk %s  %d:%d %d%%",
 								   fb->len/1000, fb->file_path, cursor_y + buf->y_scroll, cursor_x,
 								   (int)(((float)(buf->cursor_offset+1)/(float)fb->len)*100.0f));
 	if (fb->mode & BUFFER_SELECTION_ON) {
@@ -1372,10 +1496,12 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 		writef_string(maxy-1, status_end, maxx, " %dL", abs(y1-y2));
 	}
 
-	if (buf == focused_window) {
+	if (focused) {
 		for (int i = minx; i < maxx+1; i++) {
-			if (!(fb->mode & BUFFER_SELECTION_ON))
-				tsetattr(i, cursor_y)->bg = mouse_line_bg;
+			if (!(fb->mode & BUFFER_SELECTION_ON)) {
+				if (tsetattr(i, cursor_y)->bg == default_attributes.bg)
+					tsetattr(i, cursor_y)->bg = mouse_line_bg;
+			}
 			tsetattr(i, maxy-1)->bg = alternate_bg_bright;
 		}
 	}
@@ -1387,7 +1513,8 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 		xdrawline(minx, i, maxx+1);
 
 	draw_horisontal_line(maxy-1, minx, maxx);
-	xdrawcursor(cursor_x, cursor_y, buf == focused_window);
+
+	xdrawcursor(cursor_x, cursor_y, focused);
 }
 
 // TODO: Scope checks (with it's own system, so that it can be used for auto indent as well)
@@ -1637,7 +1764,8 @@ str_contains_char(const char* string, char check)
 void
 color_selection(Glyph* letter)
 {
-	letter->bg = selection_bg;
+	if (letter->bg == default_attributes.bg)
+		letter->bg = selection_bg;
 }
 
 

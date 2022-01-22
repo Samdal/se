@@ -84,8 +84,11 @@ static void move_cursor_to_offset(const Arg* arg);
 static void move_cursor_to_end_of_buffer(const Arg* arg);
 static void clipboard_copy(const Arg* arg);
 static void clipboard_paste(const Arg* arg);
+static void search(const Arg* arg);
 static void undo(const Arg* arg);
 static void redo(const Arg* arg);
+static void search_next(const Arg* arg);
+static void search_previous(const Arg* arg);
 static void open_file_browser(const Arg* arg);
 static void buffer_kill(const Arg* arg);
 
@@ -136,6 +139,9 @@ const Shortcut shortcuts[] = {
 	{ ControlMask,          XK_z,           undo,           {0}       },
 	{ TERMMOD,              XK_Z,           redo,           {0}       },
 	{ ControlMask,          XK_s,           save_buffer,    {0}       },
+	{ ControlMask,          XK_f,           search,         {0}       },
+	{ ControlMask,          XK_n,           search_next,    {0}       },
+	{ TERMMOD,              XK_N,           search_previous,{0}       },
 	{ ControlMask,          XK_c,           clipboard_copy, {0}       },
 	{ ControlMask,          XK_v,           clipboard_paste,{0}       },
 	{ TERMMOD,              XK_Prior,       zoom,           {.f = +1} },
@@ -153,6 +159,7 @@ void(*buffer_contents_updated)(struct file_buffer*, int, enum buffer_content_rea
 int(*keypress_callback)(KeySym, int) = keypress_actions;
 void(*string_input_callback)(const char*, int) = string_insert_callback;
 void(*draw_callback)(void) = NULL;
+void(*startup_callback)(void) = NULL;
 void(*buffer_written_to_screen_callback)(struct file_buffer*, int, int,  int, int, int, int) = NULL;
 
 
@@ -329,6 +336,14 @@ clipboard_paste(const Arg* arg)
 }
 
 void
+search(const Arg* arg)
+{
+	get_file_buffer(focused_window)->mode &= ~BUFFER_SEARCH_BLOCKING_IDLE;
+	get_file_buffer(focused_window)->mode |= BUFFER_SEARCH_BLOCKING;
+	writef_to_status_bar("search: %s", get_file_buffer(focused_window)->search_term);
+}
+
+void
 undo(const Arg* arg)
 {
 	buffer_undo(get_file_buffer(focused_window));
@@ -338,6 +353,22 @@ void
 redo(const Arg* arg)
 {
 	buffer_redo(get_file_buffer(focused_window));
+}
+
+void
+search_next(const Arg* arg)
+{
+	focused_window->cursor_offset =
+		buffer_seek_string_wrap(focused_window, focused_window->cursor_offset+1,
+								get_file_buffer(focused_window)->search_term);
+}
+
+void
+search_previous(const Arg* arg)
+{
+	focused_window->cursor_offset =
+		buffer_seek_string_wrap_backwards(focused_window, focused_window->cursor_offset-1,
+										  get_file_buffer(focused_window)->search_term);
 }
 
 void
@@ -433,6 +464,11 @@ keypress_actions(KeySym keysym, int modkey)
 											buffer_move_offset_relative, -move, CURSOR_COMMAND_MOVEMENT);
 		return 1;
 	case XK_Escape:
+		fb->mode &= ~BUFFER_SEARCH_BLOCKING_MASK;
+		fb->mode &= ~BUFFER_SEARCH_NON_BLOCKING;
+		fb->mode &= ~BUFFER_SEARCH_NON_BLOCKING_BACKWARDS;
+		fb->mode &= ~BUFFER_SEARCH_BLOCKING_BACKWARDS;
+		writef_to_status_bar("");
 		return 1;
 	case XK_Return:
 		delete_selection(fb);
@@ -479,7 +515,6 @@ void string_insert_callback(const char* buf, int buflen)
 {
 	struct file_buffer* fb = get_file_buffer(focused_window);
 
-	// TODO: allow blocking of the bufferwrite, redirecting to keybinds with multiple characther length
 	if (buf[0] >= 32 || buflen > 1) {
 		delete_selection(fb);
 		buffer_insert(fb, buf, buflen, focused_window->cursor_offset, 0);

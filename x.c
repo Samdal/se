@@ -44,6 +44,7 @@ extern void(*buffer_contents_updated)(struct file_buffer* modified_fb, int curre
 // non-zero return value means the kpress function will not proceed further
 extern int(*keypress_callback)(KeySym keycode, int modkey);
 extern void(*string_input_callback)(const char* buf, int len);
+extern void(*startup_callback)(void);
 // TODO: planned callbacks:
 // buffer focused
 // window focused
@@ -77,6 +78,8 @@ extern void(*string_input_callback)(const char* buf, int len);
 
 static int file_browser_actions(KeySym keysym, int modkey);
 static void file_browser_string_insert(const char* buf, int buflen);
+static int search_term_actions(KeySym keysym, int modkey);
+static void search_term_string_insert(const char* buf, int buflen);
 static int xmakeglyphfontspecs(XftGlyphFontSpec *, const Glyph *, int, int, int);
 static void xdrawglyphfontspecs(const XftGlyphFontSpec *, Glyph, int, int, int);
 static void xdrawglyph(Glyph, int, int);
@@ -136,9 +139,6 @@ static int available_buffer_slots = 0;
 struct window_split_node root_node = {.mode = WINDOW_SINGULAR};
 struct window_split_node* focused_node = &root_node;
 struct window_buffer* focused_window = &root_node.window;
-
-char searc_term[SEARCH_TERM_LEN];
-int search_mode_on;
 
 Atom xtarget;
 char* copy_buffer;
@@ -1225,8 +1225,7 @@ draw_horisontal_line(int y, int x1, int x2)
 
 	Color drawcol = dc.col[default_attributes.fg];
 	XftDrawRect(xw.draw, &drawcol,
-				border_px + x1 * win.cw,
-				border_px + (y + 1) * win.ch - cursor_thickness,
+				border_px + x1 * win.cw, border_px + (y + 1) * win.ch - cursor_thickness,
 				win.cw * (x2-x1+1), 1);
 }
 
@@ -1514,6 +1513,74 @@ file_browser_string_insert(const char* buf, int buflen)
 	}
 }
 
+int
+search_term_actions(KeySym keysym, int modkey)
+{
+	static int first = 0;
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (keysym == XK_Return || keysym == XK_Escape) {
+		int count = buffer_count_string_instances(fb, fb->search_term, 0, NULL);
+		if (!count) {
+			fb->mode &= ~BUFFER_SEARCH_BLOCKING_MASK;
+			writef_to_status_bar("no resulrs for \"%s\"", fb->search_term);
+		} else {
+			fb->mode &= ~BUFFER_SEARCH_BLOCKING;
+			fb->mode &= ~BUFFER_SEARCH_BLOCKING_BACKWARDS;
+			fb->mode |= BUFFER_SEARCH_BLOCKING_IDLE;
+
+			writef_to_status_bar("%d results for \"%s\"", count, fb->search_term);
+			if (fb->mode & BUFFER_SEARCH_BLOCKING_BACKWARDS)
+				focused_window->cursor_offset = buffer_seek_string_backwards(fb, focused_window->cursor_offset, fb->search_term);
+			else
+				focused_window->cursor_offset = buffer_seek_string(fb, focused_window->cursor_offset, fb->search_term);
+		}
+		first = 1;
+		search_term_string_insert(NULL, 0);
+		return 1;
+	}
+	if (keysym == XK_BackSpace) {
+		if (first) {
+			first = 0;
+			*fb->search_term = 0;
+		} else {
+			remove_utf8_string_end(fb->search_term);
+			focused_window->cursor_offset = buffer_seek_string_wrap(focused_window, focused_window->cursor_offset, fb->search_term);
+		}
+		writef_to_status_bar("search: %s", fb->search_term);
+		return 1;
+	}
+	first = 0;
+	return 0;
+}
+
+void
+search_term_string_insert(const char* buf, int buflen)
+{
+	static int first = 0;
+
+	struct file_buffer* fb = get_file_buffer(focused_window);
+	if (!buf) {
+		first = 1;
+		return;
+	}
+	if (first) {
+		*fb->search_term = 0;
+		first = 0;
+	}
+	if (buf[0] >= 32 || buflen > 1) {
+		int len = strlen(fb->search_term);
+		if (len + buflen + 1 > SEARCH_TERM_MAX_LEN)
+			return;
+		memcpy(fb->search_term + len, buf, buflen);
+		fb->search_term[len + buflen] = 0;
+		if (fb->mode & BUFFER_SEARCH_BLOCKING_BACKWARDS)
+			focused_window->cursor_offset = buffer_seek_string_backwards(fb, focused_window->cursor_offset, fb->search_term);
+		else
+			focused_window->cursor_offset = buffer_seek_string(fb, focused_window->cursor_offset, fb->search_term);
+		writef_to_status_bar("search: %s", fb->search_term);
+	}
+}
+
 int match(uint mask, uint state) {
 	const uint ignoremod = Mod2Mask|XK_SWITCH_MOD;
 	return mask == XK_ANY_MOD || mask == (state & ~ignoremod);
@@ -1536,10 +1603,14 @@ kpress(XEvent *ev)
 		len = XmbLookupString(xw.ime.xic, e, buf, sizeof buf, &ksym, &status);
 	else
 		len = XLookupString(e, buf, sizeof buf, &ksym, NULL);
+	const struct file_buffer* fb = get_file_buffer(focused_window);
 
 	// keysym callback
 	if (focused_window->mode == WINDOW_BUFFER_FILE_BROWSER) {
-		if(file_browser_actions(ksym, e->state))
+		if (file_browser_actions(ksym, e->state))
+			return;
+	} else if (fb->mode & BUFFER_SEARCH_BLOCKING) {
+		if (search_term_actions(ksym, e->state))
 			return;
 	} else if (keypress_callback) {
 		if (keypress_callback(ksym, e->state))
@@ -1558,6 +1629,8 @@ kpress(XEvent *ev)
 		}
 		if (focused_window->mode == WINDOW_BUFFER_FILE_BROWSER)
 			file_browser_string_insert(buf, len);
+		else if (fb->mode & BUFFER_SEARCH_BLOCKING)
+			search_term_string_insert(buf, len);
 		else
 			string_input_callback(buf, len);
 	}
@@ -1644,14 +1717,16 @@ run(void)
 		XFlush(xw.dpy);
 	}
 }
-#include <sys/time.h>
+
 int
 main(int argc, char *argv[])
 {
+	if (startup_callback) {
+		startup_callback();
+	}
 	xw.l = xw.t = 0;
 	xw.isfixed = False;
 	xsetcursor(cursor_shape);
-
 
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
@@ -1690,10 +1765,11 @@ main(int argc, char *argv[])
 		}
 	}
 
-	static const char* const welcome[] = {"Welcome to se!", "Good day", "Happy Coding", "se: the Simple Editor",
-		"Time to get some progress done!", "When someone extends se, will it be called sex?", "Ready for combat",
-		"Initialising...Done", "Fun fact: vscode has over two times as many lines describing dependencies than se has in total",
-		"You look based"};
+	static const char* const welcome[] = {"Welcome to se!", "Good day, Human", "Happy Coding", "se: the Simple Editor",
+		"Time to get some progress done!", "Ready for combat", "Initialising...Done",  "loaded in %%d seconds",
+		"Fun fact: vscode has over two times as many lines describing dependencies than se has in total",
+		"You look based", "Another day, another bug to fix", "Who needs a mouse ¯\\_(ツ)_/¯", "grrgrrggghhaaaaaa (╯°□ °）╯︵ ┻━┻",
+		"┬┴┬┤(･_├┬┴┬┤├┬┴┬┴┬┤ʖ ͡°) ├┬┴┬┴┬┴┬┴┬┴┬┴┬┴┬┴┬┴┬┴", "ʰᵉˡˡᵒ", "(=^ ◡ ^=)"};
 
 	srand(time(NULL));
 	writef_to_status_bar(welcome[rand() % LEN(welcome)]);
