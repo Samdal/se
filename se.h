@@ -14,7 +14,7 @@
 #define UNDO_BUFFERS_COUNT 32
 #define UPPER_CASE_WORD_MIN_LEN 3
 #define STATUS_BAR_MAX_LEN 4096
-#define SEARCH_TERM_MAX_LEN 4096
+#define SEARCH_TERM_MAX_LEN PATH_MAX
 
 #define MIN(a, b)		((a) < (b) ? (a) : (b))
 #define MAX(a, b)		((a) < (b) ? (b) : (a))
@@ -128,7 +128,8 @@ enum move_directons {
 
 struct window_split_node* window_switch_to_window(struct window_split_node* node, enum move_directons move);
 // NOTE: if you have two splits both having two splits of the same type, you can't resize the upper split
-void window_node_resize(struct window_split_node* node, enum move_directons move);
+void window_node_resize(struct window_split_node* node, enum move_directons move, float amount);
+void window_node_resize_absolute(struct window_split_node* node, enum move_directons move, float amount);
 
 ////////////////////////////////////////////////
 // Color Scheme
@@ -239,7 +240,6 @@ void buffer_write_to_filepath(const struct file_buffer* buffer);
 void buffer_undo(struct file_buffer* buf);
 void buffer_redo(struct file_buffer* buf);
 
-// TODO: string compare that doesn't care if of capitalisation if the search is all lower case
 int buffer_is_on_a_word(const struct file_buffer* fb, int offset, const char* word_seperators);
 int buffer_is_start_of_a_word(const struct file_buffer* fb, int offset, const char* word_seperators);
 int buffer_is_on_word(const struct file_buffer* fb, int offset, const char* word_seperators, const char* word);
@@ -269,15 +269,21 @@ char* buffer_get_selection(struct file_buffer* buf, int* selection_len);
 int   buffer_is_selection_start_top_left(const struct file_buffer* buffer);
 void  buffer_remove_selection(struct file_buffer* buffer);
 
+///////////////////////////////////
+// returns a null terminated string containing the current line
+// the returned value must be freed by the reciever
+char* buffer_get_line_at_offset(const struct file_buffer* fb, int offset);
+// result must be freed
+char* file_path_get_path(const char* path);
+
 ////////////////////////////////////////////////
 // Other
 //
 
 void die(const char *, ...);
 int is_file_type(const char* file_path, const char* file_type);
-char* file_path_get_path(const char* path);
 int path_is_folder(const char* path);
-int file_browser_next_item(DIR* dir, const char* path, const char* search, char* full_path, char* filename, int* offset);
+const char* file_browser_next_item(const char* path, const char* search, int* offset, Glyph* attr);
 int write_string(const char* string, int y, int minx, int maxx);
 int writef_to_status_bar(const char* fmt, ...);
 void draw_status_bar();

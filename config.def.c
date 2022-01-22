@@ -77,7 +77,7 @@ static void zoomabs(const Arg* arg);
 static void zoomreset(const Arg* arg);
 static void cursor_move_x_relative(const Arg* arg);
 static void cursor_move_y_relative(const Arg* arg);
-static void change_to_file_buffer(const Arg* arg);
+static void swap_to_next_file_buffer(const Arg* arg);
 static void save_buffer(const Arg* arg);
 static void toggle_selection(const Arg* arg);
 static void move_cursor_to_offset(const Arg* arg);
@@ -127,7 +127,7 @@ const Shortcut shortcuts[] = {
 	{ TERMMOD,              XK_Left,        window_resize,                {.i = MOVE_LEFT}  },
 	{ TERMMOD,              XK_Down,        window_resize,                {.i = MOVE_DOWN}  },
 	{ TERMMOD,              XK_Up,          window_resize,                {.i = MOVE_UP}    },
-	{ ControlMask,          XK_Tab,         change_to_file_buffer,        {.i = +1}         },
+	{ ControlMask,          XK_Tab,         swap_to_next_file_buffer,     {0}       },
 	{ ControlMask,          XK_m,           toggle_selection,             {0}       },
 	{ ControlMask,          XK_g,           move_cursor_to_offset,        {0}       },
 	{ TERMMOD,              XK_G,           move_cursor_to_end_of_buffer, {0}       },
@@ -205,7 +205,8 @@ void window_split(const Arg *arg)
 
 void window_resize(const Arg *arg)
 {
-	window_node_resize(focused_node, arg->i);
+	float amount = (arg->i == MOVE_RIGHT || arg->i == MOVE_LEFT) ? 0.1f : 0.05f;
+	window_node_resize(focused_node, arg->i, amount);
 }
 
 void window_delete(const Arg *arg)
@@ -267,24 +268,9 @@ cursor_move_y_relative(const Arg* arg)
 }
 
 void
-change_to_file_buffer(const Arg* arg)
+swap_to_next_file_buffer(const Arg* arg)
 {
-	if (arg->i < 0) {
-		int prev_buffer_index = focused_window->buffer_index;
-		focused_window->buffer_index += 1;
-		get_file_buffer(focused_window);
-		if (focused_window->buffer_index == prev_buffer_index)
-			return;
-
-		for (int i = 0; ; i++) {
-			focused_window->buffer_index += prev_buffer_index - arg->i - i;
-			get_file_buffer(focused_window);
-			if (focused_window->buffer_index != prev_buffer_index)
-				return;
-		}
-	}
-
-	focused_window->buffer_index += arg->i;
+	focused_window->buffer_index++;
 }
 
 void
@@ -358,17 +344,29 @@ redo(const Arg* arg)
 void
 search_next(const Arg* arg)
 {
-	focused_window->cursor_offset =
-		buffer_seek_string_wrap(focused_window, focused_window->cursor_offset+1,
-								get_file_buffer(focused_window)->search_term);
+	int new_offset = buffer_seek_string_wrap(focused_window, focused_window->cursor_offset+1,
+											 get_file_buffer(focused_window)->search_term);
+	if (new_offset < 0) {
+		writef_to_status_bar("no results for \"%s\"", get_file_buffer(focused_window)->search_term);
+		return;
+	} else if (focused_window->cursor_offset > new_offset) {
+		writef_to_status_bar("search wrapped");
+	}
+	focused_window->cursor_offset = new_offset;
 }
 
 void
 search_previous(const Arg* arg)
 {
-	focused_window->cursor_offset =
-		buffer_seek_string_wrap_backwards(focused_window, focused_window->cursor_offset-1,
-										  get_file_buffer(focused_window)->search_term);
+	int new_offset = buffer_seek_string_wrap_backwards(focused_window, focused_window->cursor_offset-1,
+													   get_file_buffer(focused_window)->search_term);
+	if (new_offset < 0) {
+		writef_to_status_bar("no results for \"%s\"", get_file_buffer(focused_window)->search_term);
+		return;
+	} else if (focused_window->cursor_offset < new_offset) {
+		writef_to_status_bar("search wrapped");
+	}
+	focused_window->cursor_offset = new_offset;
 }
 
 void
