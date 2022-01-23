@@ -61,9 +61,15 @@ typedef Glyph *Line;
 // Window buffer
 //
 
+// NOTE:
+// refrain from entering the buffers or buffer keyword searching
+// mode if you already are in file browser mode
 enum window_buffer_mode {
 	WINDOW_BUFFER_NORMAL = 0,
 	WINDOW_BUFFER_FILE_BROWSER,
+	WINDOW_BUFFER_SEARCH_BUFFERS,
+	WINDOW_BUFFER_KEYWORD_ALL_BUFFERS,
+	WINDOW_BUFFER_MODE_LEN,
 };
 
 struct window_buffer {
@@ -81,7 +87,6 @@ void buffer_write_selection(struct window_buffer* buf, int minx, int miny, int m
 void  buffer_move_cursor_to_selection_start(struct window_buffer* buffer);
 
 void buffer_offset_to_xy(struct window_buffer* buf, int offset, int maxx, int* cx, int* cy);
-void buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, int maxy);
 
 enum cursor_reason {
 	CURSOR_DO_NOT_CALLBACK = 0,
@@ -109,6 +114,8 @@ struct window_split_node {
 	enum window_split_mode mode;
 	float ratio;
 	struct window_split_node *node1, *node2, *parent;
+	char* search;
+	int selected;
 };
 
 void window_node_split(struct window_split_node* parent, float ratio, enum window_split_mode mode);
@@ -280,10 +287,19 @@ char* file_path_get_path(const char* path);
 // Other
 //
 
+struct keyword_pos {
+	int offset, buffer_index;
+};
+
+const char* file_browser_next_item(const char* path, const char* search, int* offset, Glyph* attr, void* data);
+// data pointer will give the file buffer of the current item
+const char* buffer_search_next_item(const char* tmp, const char* search, int* offset, Glyph* attr, void* data);
+// data pointer will give the keyword_pos of the current item
+const char* buffers_search_keyword_next_item(const char* tmp, const char* search, int* offset, Glyph* attr, void* data);
+
 void die(const char *, ...);
 int is_file_type(const char* file_path, const char* file_type);
 int path_is_folder(const char* path);
-const char* file_browser_next_item(const char* path, const char* search, int* offset, Glyph* attr);
 int write_string(const char* string, int y, int minx, int maxx);
 int writef_to_status_bar(const char* fmt, ...);
 void draw_status_bar();

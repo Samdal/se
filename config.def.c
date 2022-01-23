@@ -84,11 +84,13 @@ static void move_cursor_to_offset(const Arg* arg);
 static void move_cursor_to_end_of_buffer(const Arg* arg);
 static void clipboard_copy(const Arg* arg);
 static void clipboard_paste(const Arg* arg);
-static void search(const Arg* arg);
 static void undo(const Arg* arg);
 static void redo(const Arg* arg);
+static void search(const Arg* arg);
 static void search_next(const Arg* arg);
 static void search_previous(const Arg* arg);
+static void search_for_buffer(const Arg* arg);
+static void search_keyword_in_buffers(const Arg* arg);
 static void open_file_browser(const Arg* arg);
 static void buffer_kill(const Arg* arg);
 
@@ -140,6 +142,8 @@ const Shortcut shortcuts[] = {
 	{ TERMMOD,              XK_Z,           redo,           {0}       },
 	{ ControlMask,          XK_s,           save_buffer,    {0}       },
 	{ ControlMask,          XK_f,           search,         {0}       },
+	{ TERMMOD,              XK_F,           search_keyword_in_buffers,{0},},
+	{ ControlMask,          XK_space,       search_for_buffer,{0},    },
 	{ ControlMask,          XK_n,           search_next,    {0}       },
 	{ TERMMOD,              XK_N,           search_previous,{0}       },
 	{ ControlMask,          XK_c,           clipboard_copy, {0}       },
@@ -322,14 +326,6 @@ clipboard_paste(const Arg* arg)
 }
 
 void
-search(const Arg* arg)
-{
-	get_file_buffer(focused_window)->mode &= ~BUFFER_SEARCH_BLOCKING_IDLE;
-	get_file_buffer(focused_window)->mode |= BUFFER_SEARCH_BLOCKING;
-	writef_to_status_bar("search: %s", get_file_buffer(focused_window)->search_term);
-}
-
-void
 undo(const Arg* arg)
 {
 	buffer_undo(get_file_buffer(focused_window));
@@ -339,6 +335,14 @@ void
 redo(const Arg* arg)
 {
 	buffer_redo(get_file_buffer(focused_window));
+}
+
+void
+search(const Arg* arg)
+{
+	get_file_buffer(focused_window)->mode &= ~BUFFER_SEARCH_BLOCKING_IDLE;
+	get_file_buffer(focused_window)->mode |= BUFFER_SEARCH_BLOCKING;
+	writef_to_status_bar("search: %s", get_file_buffer(focused_window)->search_term);
 }
 
 void
@@ -368,6 +372,27 @@ search_previous(const Arg* arg)
 	}
 	focused_window->cursor_offset = new_offset;
 }
+
+void
+search_for_buffer(const Arg* arg)
+{
+	if (focused_window->mode != WINDOW_BUFFER_NORMAL)
+		return;
+	*focused_node->search = 0;
+	focused_node->selected = 0;
+	focused_window->mode = WINDOW_BUFFER_SEARCH_BUFFERS;
+}
+
+void
+search_keyword_in_buffers(const Arg* arg)
+{
+	if (focused_window->mode != WINDOW_BUFFER_NORMAL)
+		return;
+	*focused_node->search = 0;
+	focused_node->selected = 0;
+	focused_window->mode = WINDOW_BUFFER_KEYWORD_ALL_BUFFERS;
+}
+
 
 void
 open_file_browser(const Arg* arg)
@@ -414,7 +439,7 @@ cursor_callback(struct window_buffer* buf, enum cursor_reason callback_reason)
 	keep_cursor_col(buf, callback_reason);
 	move_selection(buf, callback_reason);
 
-	 printf("moved to: %d | reason: %d\n", buf->cursor_offset, callback_reason);
+	 //printf("moved to: %d | reason: %d\n", buf->cursor_offset, callback_reason);
 }
 
 void
@@ -519,6 +544,6 @@ void string_insert_callback(const char* buf, int buflen)
 		window_move_all_cursors_on_same_buf(&root_node, NULL, focused_window->buffer_index, focused_window->cursor_offset,
 											buffer_move_offset_relative, buflen, CURSOR_COMMAND_MOVEMENT);
 	} else {
-		printf("unhandled control character %x\n", buf[0]);
+		writef_to_status_bar("unhandled control character 0x%x\n", buf[0]);
 	}
 }

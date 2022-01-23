@@ -58,12 +58,23 @@ extern void(*buffer_written_to_screen_callback)(struct window_buffer*, int, int,
 // Internal functions
 //
 
+static void buffer_draw_to_screen(struct window_split_node* wn, int minx, int miny, int maxx, int maxy);
+static void choose_one_of_selection(const char* prefix, const char* search, const char* err,
+									const char*(*get_next_element)(const char*, const char*, int* offset, Glyph* attr, void* data),
+									int* selected_line, int minx, int miny, int maxx, int maxy, int focused);
+static void draw_dir(struct window_split_node* win, int minx, int miny, int maxx, int maxy, int focused);
+static void draw_search_buffers(struct window_split_node* wn, int minx, int miny, int maxx, int maxy, int focused);
+static void draw_search_keyword_in_all_buffers(struct window_split_node* wn, int minx, int miny, int maxx, int maxy, int focused);
+void(*alternate_buffer_modes[WINDOW_BUFFER_MODE_LEN])
+(struct window_split_node* wn, int minx, int miny, int maxx, int maxy, int focused) = {
+	[WINDOW_BUFFER_NORMAL] = NULL,
+	[WINDOW_BUFFER_FILE_BROWSER] = draw_dir,
+	[WINDOW_BUFFER_SEARCH_BUFFERS] = draw_search_buffers,
+	[WINDOW_BUFFER_KEYWORD_ALL_BUFFERS] = draw_search_keyword_in_all_buffers
+};
+
 static void recursive_mkdir(char* path);
 static int writef_string(int y, int x1, int x2, const char* fmt, ...);
-void choose_one_of_selection(const char* prefix, const char* search, const char* err,
-							 const char*(*get_next_element)(const char*, const char*, int* offset, Glyph* attr),
-							 int* selected_line, int minx, int miny, int maxx, int maxy, int focused);
-static void draw_dir(const char* path, const char* search, int* sel, int minx, int miny, int maxx, int maxy, int focused);
 static void color_selection(Glyph* letter);
 static void do_color_scheme(struct file_buffer* fb, const struct color_scheme* cs, int offset);
 static int  str_contains_char(const char* string, char check);
@@ -568,6 +579,8 @@ window_node_split(struct window_split_node* parent, float ratio, enum window_spl
 
 	parent->node1 = xmalloc(sizeof(struct window_split_node));
 	parent->node2 = xmalloc(sizeof(struct window_split_node));
+	parent->node1->search = xmalloc(SEARCH_TERM_MAX_LEN);
+	parent->node2->search = xmalloc(SEARCH_TERM_MAX_LEN);
 
 	*parent->node1 = *parent;
 	*parent->node2 = *parent;
@@ -594,6 +607,7 @@ window_node_delete(struct window_split_node* node)
 	struct window_split_node* old = node;
 	node = node->parent;
 	struct window_split_node* other = (node->node1 == old) ? node->node2 : node->node1;
+	free(old->search);
 	free(old);
 
 	struct window_split_node* parent = node->parent;
@@ -614,7 +628,7 @@ window_draw_tree_to_screen(struct window_split_node* root, int minx, int miny, i
 	assert(root);
 
 	if (root->mode == WINDOW_SINGULAR) {
-		buffer_draw_to_screen(&root->window, minx, miny, maxx, maxy);
+		buffer_draw_to_screen(root, minx, miny, maxx, maxy);
 	} else if (root->mode == WINDOW_HORISONTAL) {
 		int middlex = ((float)(maxx - minx) * root->ratio) + minx;
 
@@ -772,7 +786,7 @@ file_path_get_path(const char* path)
 }
 
 const char*
-file_browser_next_item(const char* path, const char* search, int* offset, Glyph* attr)
+file_browser_next_item(const char* path, const char* search, int* offset, Glyph* attr, void* data)
 {
 	static char filename_search[PATH_MAX];
 	static char filename[PATH_MAX];
@@ -837,12 +851,126 @@ file_browser_next_item(const char* path, const char* search, int* offset, Glyph*
 	return NULL;
 }
 
+const char*
+buffer_search_next_item(const char* tmp, const char* search, int* offset, Glyph* attr, void* data)
+{
+	static struct window_buffer wb;
+	static char file_path[PATH_MAX];
+	static int quit_next = 0;
+	if (!tmp || !search) {
+		wb.buffer_index = 0;
+		quit_next = 0;
+		return NULL;
+	}
+
+	int len = strlen(search);
+	for(;;) {
+		if (quit_next) {
+			wb.buffer_index = 0;
+			quit_next = 0;
+			return NULL;
+		}
+		struct file_buffer* fb = get_file_buffer(&wb);
+		int last_buffer_index = wb.buffer_index;
+		wb.buffer_index++;
+		get_file_buffer(&wb);
+		if (wb.buffer_index <= last_buffer_index)
+			quit_next = 1;
+
+		strcpy(file_path, fb->file_path);
+
+		const char* s_repl = search;
+		while(!isupper(*s_repl++)) {
+			if (*s_repl == 0) {
+				for (char* fs = file_path; *fs; fs++)
+					*fs = tolower(*fs);
+				break;
+			}
+		}
+		char* search_start = file_path;
+
+		if (!len)
+			goto search_match;
+		while ((search_start = strchr(search_start+1, *search))) {
+			if (memcmp(search_start, search, len) == 0) {
+			search_match:
+				if (offset)
+					*offset = search_start - file_path;
+				if (data)
+					*(int*)data = last_buffer_index;
+				return fb->file_path;
+			}
+		}
+	}
+}
+
+const char*
+buffers_search_keyword_next_item(const char* tmp, const char* search, int* offset, Glyph* attr, void* data)
+{
+	static char item[2048];
+	static struct window_buffer wb;
+	static int pos = -1;
+	if (!tmp || !search) {
+		wb.buffer_index = 0;
+		pos = -1;
+		return NULL;
+	}
+	int len = strlen(search);
+	if (!len)
+		return NULL;
+
+	for (;;) {
+		struct file_buffer* fb = get_file_buffer(&wb);
+
+		if ((pos = buffer_seek_string(fb, pos+1, search)) >= 0) {
+			const char* filename = strrchr(fb->file_path, '/')+1;
+			if (!filename)
+				filename = fb->file_path;
+
+			int tmp, y;
+			buffer_offset_to_xy(&wb, pos, 0, &tmp, &y);
+
+			snprintf(item, 2048, "%s:%d: ", filename, y);
+			int itemlen = strlen(item);
+
+			char* line = buffer_get_line_at_offset(fb, pos);
+			char* line_no_whitespace = line;
+			if (!isspace(*search))
+				while(isspace(*line_no_whitespace)) line_no_whitespace++;
+
+			snprintf(item + itemlen, 2048 - itemlen, "%s", line_no_whitespace);
+			free(line);
+
+			int line_start = buffer_seek_char_backwards(fb, pos, '\n') + (line_no_whitespace - line);
+			if (line_start < 0)
+				line_start = 0;
+			if (offset)
+				*offset = (pos - line_start) + itemlen;
+			if (data)
+				*(struct keyword_pos*)data = (struct keyword_pos){.offset = pos, .buffer_index = wb.buffer_index};
+			pos = buffer_seek_char(fb, pos+1, '\n');
+			return item;
+		} else {
+			int last_buffer_index = wb.buffer_index;
+			wb.buffer_index++;
+			get_file_buffer(&wb);
+			if (wb.buffer_index <= last_buffer_index)
+				break;
+			pos = -1;
+		}
+	}
+	wb.buffer_index = 0;
+	pos = -1;
+	return NULL;
+}
+
 void
 choose_one_of_selection(const char* prefix, const char* search, const char* err,
-						const char*(*get_next_element)(const char*, const char*, int* offset, Glyph* attr),
+						const char*(*get_next_element)(const char*, const char*, int* offset, Glyph* attr, void* data),
 						int* selected_line, int minx, int miny, int maxx, int maxy, int focused)
 {
 	assert(prefix);
+	assert(search);
 	assert(err);
 	assert(selected_line);
 	assert(get_next_element);
@@ -851,28 +979,31 @@ choose_one_of_selection(const char* prefix, const char* search, const char* err,
 	global_attr.bg = alternate_bg_dark;
 	tsetregion(minx, miny+1, maxx, maxy, ' ');
 	global_attr = default_attributes;
-	get_next_element(NULL, NULL, NULL, NULL);
+	get_next_element(NULL, NULL, NULL, NULL, NULL);
 
 	int len = strlen(search);
 
 	// count folders to get scroll
-	int folder_lines = maxy - miny - 1;
+	int folder_lines = maxy - miny - 2;
 	int elements = 0;
 	int tmp_offset;
-    while(get_next_element(prefix, search, &tmp_offset, NULL))
+	int limit = MAX(*selected_line, 999);
+    while(get_next_element(prefix, search, &tmp_offset, NULL, NULL) && elements <= limit)
 		elements++;
-	get_next_element(NULL, NULL, NULL, NULL);
+	get_next_element(NULL, NULL, NULL, NULL, NULL);
 	*selected_line = MIN(*selected_line, elements-1);
 	int sel_local = *selected_line;
 
 	// print num of files
 	char count[256];
-	if (sel_local > folder_lines)
-		snprintf(count, sizeof(count), "^[%2d] ", elements);
+	if (elements >= 1000)
+		snprintf(count, sizeof(count), "[>999:%2d] ", *selected_line+1);
+	else if (*selected_line > folder_lines)
+		snprintf(count, sizeof(count), "^[%3d:%2d] ", elements, *selected_line+1);
 	else if (elements-1 > folder_lines)
-		snprintf(count, sizeof(count), "ˇ[%2d] ", elements);
+		snprintf(count, sizeof(count), "ˇ[%3d:%2d] ", elements, *selected_line+1);
 	else
-		snprintf(count, sizeof(count), " [%2d] ", elements);
+		snprintf(count, sizeof(count), " [%3d:%2d] ", elements, *selected_line+1);
 
 	// print search term with prefix in front of it
 	// prefix is in path_color
@@ -890,7 +1021,7 @@ choose_one_of_selection(const char* prefix, const char* search, const char* err,
 	global_attr = default_attributes;
 	global_attr.bg = alternate_bg_dark;
 	const char* element;
-    while(miny <= maxy && (element = get_next_element(prefix, search, &offset, &global_attr))) {
+    while(miny <= maxy && (element = get_next_element(prefix, search, &offset, &global_attr, NULL))) {
 		if (elements > folder_lines && sel_local > folder_lines) {
 			elements--;
 			sel_local--;
@@ -899,7 +1030,7 @@ choose_one_of_selection(const char* prefix, const char* search, const char* err,
 		write_string(element, miny, minx, maxx+1);
 
 		// change the color to highlight search term
-		for (int i = minx + offset; i < minx + len + offset && i < maxx; i++)
+		for (int i = minx + offset; i < minx + len + offset && i < maxx+1; i++)
 			tsetattr(i, miny)->fg = highlight_color;
 		// change the background of the selected line
 		if (miny - start_miny - 1 == sel_local)
@@ -926,9 +1057,32 @@ choose_one_of_selection(const char* prefix, const char* search, const char* err,
 }
 
 void
-draw_dir(const char* path, const char* search, int* sel, int minx, int miny, int maxx, int maxy, int focused)
+draw_dir(struct window_split_node* wn, int minx, int miny, int maxx, int maxy, int focused)
 {
-	choose_one_of_selection(path, search, " [Create New File]", file_browser_next_item, sel, minx, miny, maxx, maxy, focused);
+	struct file_buffer* fb = get_file_buffer(&wn->window);
+	char* folder = file_path_get_path(fb->file_path);
+
+	buffer_change(fb, "\0", 1, fb->len, 1);
+	if (fb->len > 0) fb->len--;
+
+	choose_one_of_selection(folder, fb->contents, " [Create New File]",
+							file_browser_next_item, &wn->selected, minx, miny, maxx, maxy, focused);
+
+	free(folder);
+}
+
+void
+draw_search_buffers(struct window_split_node* wn, int minx, int miny, int maxx, int maxy, int focused)
+{
+	choose_one_of_selection("Find loaded buffer: ", wn->search, " [No resuts]",
+							buffer_search_next_item, &wn->selected, minx, miny, maxx, maxy, focused);
+}
+
+void
+draw_search_keyword_in_all_buffers(struct window_split_node* wn, int minx, int miny, int maxx, int maxy, int focused)
+{
+	choose_one_of_selection("Find in all buffers: ", wn->search, " [No resuts]",
+							buffers_search_keyword_next_item, &wn->selected, minx, miny, maxx, maxy, focused);
 }
 
 void recursive_mkdir(char *path) {
@@ -1328,8 +1482,9 @@ buffer_offset_to_xy(struct window_buffer* buf, int offset, int maxx, int* cx, in
 }
 
 void
-buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, int maxy)
+buffer_draw_to_screen(struct window_split_node* wn, int minx, int miny, int maxx, int maxy)
 {
+	struct window_buffer* buf = &wn->window;
 	assert(buf);
 	struct file_buffer* fb = get_file_buffer(buf);
 
@@ -1341,15 +1496,10 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 	tsetregion(minx, miny, maxx, maxy, ' ');
 	int focused = buf == focused_window && !(fb->mode & BUFFER_SEARCH_BLOCKING);
 
-	if (buf->mode == WINDOW_BUFFER_FILE_BROWSER) {
-		char* folder = file_path_get_path(fb->file_path);
-
-		buffer_change(fb, "\0", 1, fb->len, 1);
-		if (fb->len > 0) fb->len--;
-
-		draw_dir(folder, fb->contents, &buf->y_scroll, minx, miny, maxx, maxy, focused);
-
-		free(folder);
+	if (buf->mode > WINDOW_BUFFER_NORMAL) {
+		// alternate buffer modes
+		assert(buf->mode < WINDOW_BUFFER_MODE_LEN);
+		alternate_buffer_modes[buf->mode](wn, minx, miny, maxx, maxy, focused);
 		return;
 	}
 
@@ -1534,7 +1684,7 @@ buffer_draw_to_screen(struct window_buffer* buf, int minx, int miny, int maxx, i
 	const char* name = strrchr(fb->file_path, '/');
 	if (name)
 		status_end = writef_string(maxy-1, status_end, maxx+1, "%s", name+1);
-	status_end = writef_string(maxy-1, status_end, maxx+1, "  %d:%d %d%%" , cursor_y + buf->y_scroll, cursor_x,
+	status_end = writef_string(maxy-1, status_end, maxx+1, "  %d:%d %d%%" , cursor_y + buf->y_scroll, cursor_x - minx + xscroll,
 								   (int)(((float)(buf->cursor_offset+1)/(float)fb->len)*100.0f));
 	if (fb->mode & BUFFER_SELECTION_ON) {
 		int y1, y2, tmp;
@@ -1792,7 +1942,10 @@ write_string(const char* string, int y, int minx, int maxx)
 	int len = strlen(string);
 	while(minx < maxx && offset < len) {
 		Rune u;
-		offset += t_decode_utf8_buffer(string + offset, len - offset, &u);
+		int charsize = t_decode_utf8_buffer(string + offset, len - offset, &u);
+		offset += charsize;
+		if (charsize == 1 && u <= 32)
+			u = ' ';
 		minx += tsetchar(u, minx, y);
 	}
 	return minx;
