@@ -78,6 +78,9 @@ extern void(*startup_callback)(void);
 
 static int file_browser_actions(KeySym keysym, int modkey);
 static void file_browser_string_insert(const char* buf, int buflen);
+static int buffer_search_actions(KeySym keysym, int modkey);
+static void buffer_search_string_insert(const char* buf, int buflen);
+
 static int search_term_actions(KeySym keysym, int modkey);
 static void search_term_string_insert(const char* buf, int buflen);
 static int open_seproj(struct file_buffer fb);
@@ -137,7 +140,8 @@ extern Term term;
 static struct file_buffer* file_buffers;
 static int available_buffer_slots = 0;
 
-struct window_split_node root_node = {.mode = WINDOW_SINGULAR};
+static char root_node_search[SEARCH_TERM_MAX_LEN];
+struct window_split_node root_node = {.mode = WINDOW_SINGULAR, .search = root_node_search};
 struct window_split_node* focused_node = &root_node;
 struct window_buffer* focused_window = &root_node.window;
 
@@ -217,7 +221,7 @@ open_seproj(struct file_buffer fb)
 	}
 
 	if (first < 0)
-		first = new_file_buffer_entry("/home/halvard/Code/C/se/se.c");
+		first = new_file_buffer_entry(NULL);
 	writef_to_status_bar("opened project %s", path);
 	free(path);
 
@@ -1446,7 +1450,7 @@ file_browser_actions(KeySym keysym, int modkey)
 		offset = focused_window->cursor_offset;
 
 		buffer_remove(fb, offset, 1, 0, 0);
-		focused_window->y_scroll = 0;
+		focused_node->selected = 0;
 		return 1;
 	case XK_Tab:
 	case XK_Return:
@@ -1455,22 +1459,21 @@ file_browser_actions(KeySym keysym, int modkey)
 		buffer_change(fb, "\0", 1, fb->len, 1);
 		if (fb->len > 0) fb->len--;
 
-		file_browser_next_item(NULL, NULL, NULL, NULL);
+		file_browser_next_item(NULL, NULL, NULL, NULL, NULL);
 		const char* filename;
-		for (int y = 0; (filename = file_browser_next_item(path, fb->contents, NULL, NULL)); y++) {
+		for (int y = 0; (filename = file_browser_next_item(path, fb->contents, NULL, NULL, NULL)); y++) {
 			strcpy(full_path, path);
 			strcat(full_path, filename);
-			if (y == focused_window->y_scroll) {
+			if (y == focused_node->selected) {
 				if (path_is_folder(full_path)) {
 					strcpy(fb->file_path, full_path);
 
 					fb->len = 0;
 					fb->contents[0] = '\0';
-					focused_window->y_scroll = 0;
-					focused_window->y_scroll = 0;
+					focused_node->selected = 0;
 
 					free(path);
-					file_browser_next_item(NULL, NULL, NULL, NULL);
+					file_browser_next_item(NULL, NULL, NULL, NULL, NULL);
 					*full_path = 0;
 					return 1;
 				}
@@ -1495,14 +1498,12 @@ open_file:
 		return 1;
 	}
 	case XK_Down:
-		focused_window->y_scroll++;
-		if (focused_window->y_scroll < 0)
-			focused_window->y_scroll = 0;
+		focused_node->selected++;
 		return 1;
 	case XK_Up:
-		focused_window->y_scroll--;
-		if (focused_window->y_scroll < 0)
-			focused_window->y_scroll = 0;
+		focused_node->selected--;
+		if (focused_node->selected < 0)
+			focused_node->selected = 0;
 		return 1;
 	case XK_Escape:
 		if (destroy_file_buffer_entry(focused_node, &root_node))
@@ -1538,8 +1539,7 @@ file_browser_string_insert(const char* buf, int buflen)
 
 	if (buf[0] >= 32 || buflen > 1) {
 		buffer_insert(fb, buf, buflen, fb->len, 0);
-		buffer_move_offset_relative(focused_window, buflen, 0);
-		focused_window->y_scroll = 0;
+		focused_node->selected = 0;
 
 		if (*buf == '/') {
 			buffer_change(fb, "\0", 1, fb->len, 0);
@@ -1556,7 +1556,87 @@ file_browser_string_insert(const char* buf, int buflen)
 			}
 		}
 	} else {
-		printf("unhandled control character %x\n", buf[0]);
+		writef_to_status_bar("unhandled control character 0x%x\n", buf[0]);
+	}
+}
+
+int
+buffer_search_actions(KeySym keysym, int modkey)
+{
+	switch (keysym) {
+	case XK_Return:
+	case XK_Tab:
+		if (focused_window->mode == WINDOW_BUFFER_KEYWORD_ALL_BUFFERS) {
+			struct keyword_pos kw;
+			int n = 0;
+			buffers_search_keyword_next_item(NULL, NULL, NULL, NULL, NULL);
+			while (buffers_search_keyword_next_item("", focused_node->search, NULL, NULL, &kw)) {
+				if (n == focused_node->selected) {
+					*focused_window = window_buffer_new(kw.buffer_index);
+					focused_window->cursor_offset = kw.offset;
+					return 1;
+				}
+				n++;
+			}
+			buffers_search_keyword_next_item(NULL, NULL, NULL, NULL, NULL);
+		} else if (focused_window->mode == WINDOW_BUFFER_SEARCH_BUFFERS) {
+			int buffer_index;
+			int n = 0;
+			buffer_search_next_item(NULL, NULL, NULL, NULL, NULL);
+			while (buffer_search_next_item("", focused_node->search, NULL, NULL, &buffer_index)) {
+				if (n == focused_node->selected) {
+					*focused_window = window_buffer_new(buffer_index);
+					return 1;
+				}
+				n++;
+			}
+			buffer_search_next_item(NULL, NULL, NULL, NULL, NULL);
+		}
+		puts("n");
+		return 1;
+	case XK_BackSpace:
+		remove_utf8_string_end(focused_node->search);
+		focused_node->selected = 0;
+		return 1;
+	case  XK_Down:
+		focused_node->selected++;
+		return 1;
+	case  XK_Up:
+		focused_node->selected--;
+		if (focused_node->selected < 0)
+			focused_node->selected = 0;
+		return 1;
+	case  XK_Page_Down:
+		focused_node->selected += 10;
+		return 1;
+	case  XK_Page_Up:
+		focused_node->selected -= 10;
+		if (focused_node->selected < 0)
+			focused_node->selected = 0;
+		return 1;
+	case XK_Escape:
+		if (path_is_folder(get_file_buffer(focused_window)->file_path))
+			focused_window->mode = WINDOW_BUFFER_FILE_BROWSER;
+		else
+			focused_window->mode = WINDOW_BUFFER_NORMAL;
+		return 1;
+	}
+	return 0;
+}
+
+void
+buffer_search_string_insert(const char* buf, int buflen)
+{
+	int len = strlen(focused_node->search);
+	if (buflen + len + 1 > SEARCH_TERM_MAX_LEN)
+		return;
+
+	if (buf[0] >= 32 || buflen > 1) {
+		memcpy(focused_node->search + len, buf, buflen);
+		focused_node->search[len + buflen] = 0;
+		focused_node->selected = 0;
+	} else {
+		writef_to_status_bar("unhandled control character 0x%x\n", buf[0]);
 	}
 }
 
@@ -1656,6 +1736,10 @@ kpress(XEvent *ev)
 	if (focused_window->mode == WINDOW_BUFFER_FILE_BROWSER) {
 		if (file_browser_actions(ksym, e->state))
 			return;
+	} else if (focused_window->mode & WINDOW_BUFFER_SEARCH_BUFFERS ||
+			   focused_window->mode & WINDOW_BUFFER_KEYWORD_ALL_BUFFERS) {
+		if (buffer_search_actions(ksym, e->state))
+			return;
 	} else if (fb->mode & BUFFER_SEARCH_BLOCKING) {
 		if (search_term_actions(ksym, e->state))
 			return;
@@ -1676,6 +1760,9 @@ kpress(XEvent *ev)
 		}
 		if (focused_window->mode == WINDOW_BUFFER_FILE_BROWSER)
 			file_browser_string_insert(buf, len);
+		else if (focused_window->mode & WINDOW_BUFFER_SEARCH_BUFFERS ||
+				 focused_window->mode & WINDOW_BUFFER_KEYWORD_ALL_BUFFERS)
+			buffer_search_string_insert(buf, len);
 		else if (fb->mode & BUFFER_SEARCH_BLOCKING)
 			search_term_string_insert(buf, len);
 		else
@@ -1785,8 +1872,7 @@ main(int argc, char *argv[])
 	// TODO: fix things when the file buffer is empty
 	// for example on a new file
 
-	*focused_window = window_buffer_new(new_file_buffer_entry(".seproj"));
-	/*
+
 	if (argc <= 1) {
 		*focused_window = window_buffer_new(new_file_buffer_entry(NULL));
 	} else  {
@@ -1816,7 +1902,6 @@ main(int argc, char *argv[])
 			}
 		}
 	}
-	*/
 
 	static const char* const welcome[] = {"Welcome to se!", "Good day, Human", "Happy Coding", "se: the Simple Editor",
 		"Time to get some progress done!", "Ready for combat", "Initialising...Done",  "loaded in %%d seconds",
