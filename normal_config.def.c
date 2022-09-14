@@ -59,7 +59,7 @@ const struct syntax_scheme syntax_schemes[] = {
 #include "plugins/shortcuts.h"
 #include "plugins/default_shortcuts.h"
 
-#define MODKEY Mod4Mask
+#define MODKEY Mod1Mask
 #define CtrlShift (ControlMask|ShiftMask)
 
 shortcuts = {

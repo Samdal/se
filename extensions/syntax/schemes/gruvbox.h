@@ -1,3 +1,6 @@
+#ifndef _color_scheme_
+#define _color_scheme_
+
 // see colors at: https://github.com/morhetz/gruvbox
 
 enum colour_names {
@@ -38,7 +41,7 @@ const char * const colors[] = {
 };
 
 // default colors
-Glyph default_attributes = {.fg = fg, .bg = bg};
+struct glyph default_attributes = {.fg = fg, .bg = bg};
 unsigned int alternate_bg_bright = sel;
 unsigned int alternate_bg_dark = bg0_h;
 
@@ -64,3 +67,5 @@ unsigned int ok_color = green;
 #define constants_color {.fg = dark_green}
 #define number_color	{.fg = gray}
 #define function_color  {.fg = aqua}
+
+#endif // _color_scheme_

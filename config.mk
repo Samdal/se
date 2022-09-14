@@ -21,8 +21,8 @@ LIBS = -L$(X11LIB) -lm -lrt -lX11 -lutil -lXft \
        `$(PKG_CONFIG) --libs freetype2`
 
 # flags
-SECPPFLAGS = -DVERSION=\"$(VERSION)\" -D_XOPEN_SOURCE=600
-SECFLAGS = $(INCS) $(SECPPFLAGS) $(CPPFLAGS) -g -Wall -Wpedantic -Os
+SECPPFLAGS = -D_XOPEN_SOURCE=600
+SECFLAGS = $(INCS) $(SECPPFLAGS) $(CPPFLAGS) -Wall -Wpedantic -O0 -g
 SELDFLAGS = $(LIBS) $(LDFLAGS)
 
 # OpenBSD:
