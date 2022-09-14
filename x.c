@@ -5,11 +5,9 @@
 ** Most of that part is unchanged from ST (https://st.suckless.org/)
 ** the main() function and the main loop are found at the very bottom of this file
 ** there are a very few functions here that are interresting for configuratinos.
-** I would suggest looking into x.h and seeing if any of the callbacks fit
-** your configuration needs.
 */
 
-#include <assert.h>
+
 #include <errno.h>
 #include <math.h>
 #include <locale.h>
@@ -18,45 +16,16 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <assert.h>
 
+#include "se.h"
 #include "x.h"
-
-/////////////////////////////////////////////////////
-// config.c variables that must be defined
-//
-
-extern int border_px;
-extern float cw_scale;
-extern float ch_scale;
-extern char* fontconfig;
-extern const char* const colors[];
-extern Glyph default_attributes;
-extern unsigned int cursor_fg;
-extern unsigned int cursor_bg;
-extern unsigned int cursor_thickness;
-extern unsigned int cursor_shape;
-extern unsigned int default_cols;
-extern unsigned int default_rows;
-
-// callbacks
-extern void(*draw_callback)(void);
-extern void(*buffer_contents_updated)(struct file_buffer* modified_fb, int current_pos, enum buffer_content_reason reason);
-// non-zero return value means the kpress function will not proceed further
-extern int(*keypress_callback)(KeySym keycode, int modkey);
-extern void(*string_input_callback)(const char* buf, int len);
-extern void(*startup_callback)(void);
-// TODO: planned callbacks:
-// buffer focused
-// window focused
+#include "config.h"
+#include "extension.h"
 
 //////////////////////////////////
 // macros
 //
-
-// X modifiers
-#define XK_ANY_MOD    UINT_MAX
-#define XK_NO_MOD     0
-#define XK_SWITCH_MOD (1<<13|1<<14)
 
 // XEMBED messages
 #define XEMBED_FOCUS_IN  4
@@ -72,21 +41,98 @@ extern void(*startup_callback)(void);
 #define ATTRCMP(a, b)		((a).mode != (b).mode || (a).fg != (b).fg || (a).bg != (b).bg)
 #define DIVCEIL(n, d)		(((n) + ((d) - 1)) / (d))
 
+#include <X11/Xatom.h>
+#include <X11/cursorfont.h>
+#include <X11/Xft/Xft.h>
+#include <X11/XKBlib.h>
+
+// Purely graphic info
+typedef struct {
+	int tw, th;	// tty width and height
+	int w, h;	// window width and height
+	int ch;		// char height
+	int cw;		// char width
+	int mode;	// window state/mode flags
+} TermWindow;
+extern TermWindow win;
+
+typedef XftDraw *Draw;
+typedef XftColor Color;
+typedef XftGlyphFontSpec GlyphFontSpec;
+
+typedef struct {
+	Display *dpy;
+	Colormap cmap;
+	Window win;
+	Drawable buf;
+	GlyphFontSpec *specbuf; // font spec buffer used for rendering
+	Atom xembed, wmdeletewin, netwmname, netwmiconname, netwmpid;
+	struct {
+		XIM xim;
+		XIC xic;
+		XPoint spot;
+		XVaNestedList spotlist;
+	} ime;
+	Draw draw;
+	Visual *vis;
+	XSetWindowAttributes attrs;
+	int scr;
+	int isfixed;	// is fixed geometry?
+	int l, t;		// left and top offset
+	int gm;			// geometry mask
+} XWindow;
+extern XWindow xw;
+
+// Font structure
+#define Font Font_
+typedef struct {
+	int height;
+	int width;
+	int ascent;
+	int descent;
+	int badslant;
+	int badweight;
+	short lbearing;
+	short rbearing;
+	XftFont *match;
+	FcFontSet *set;
+	FcPattern *pattern;
+} Font;
+
+// Font Ring Cache
+enum {
+	FRC_NORMAL,
+	FRC_ITALIC,
+	FRC_BOLD,
+	FRC_ITALICBOLD
+};
+
+typedef struct {
+	XftFont *font;
+	int flags;
+	rune_t unicodep;
+} Fontcache;
+
+extern Fontcache *frc;
+extern int frclen;
+
+// Drawing Context
+typedef struct {
+	Color *col;
+	size_t collen;
+	Font font, bfont, ifont, ibfont;
+	GC gc;
+} DC;
+extern DC dc;
+
 ////////////////////////////////////////
 // Internal Functions
 //
 
-static int file_browser_actions(KeySym keysym, int modkey);
-static void file_browser_string_insert(const char* buf, int buflen);
-static int buffer_search_actions(KeySym keysym, int modkey);
-static void buffer_search_string_insert(const char* buf, int buflen);
-
-static int search_term_actions(KeySym keysym, int modkey);
-static void search_term_string_insert(const char* buf, int buflen);
-static int open_seproj(struct file_buffer fb);
-static int xmakeglyphfontspecs(XftGlyphFontSpec *, const Glyph *, int, int, int);
-static void xdrawglyphfontspecs(const XftGlyphFontSpec *, Glyph, int, int, int);
-static void xdrawglyph(Glyph, int, int);
+static void xunloadfont(Font *);
+static int xmakeglyphfontspecs(XftGlyphFontSpec *, const struct glyph *, int, int, int);
+static void xdrawglyphfontspecs(const XftGlyphFontSpec *, struct glyph, int, int, int);
+static void xdrawglyph(struct glyph, int, int);
 static void xclear(int, int, int, int);
 static int xgeommasktogravity(int);
 static int ximopen(Display *);
@@ -135,26 +181,20 @@ static void (*handler[LASTEvent])(XEvent *) = {
 // Globals
 //
 
-extern Term term;
+struct screen screen;
+struct glyph global_attr;
 
-static struct file_buffer* file_buffers;
-static int available_buffer_slots = 0;
+static Atom xtarget;
+static char* copy_buffer;
+static int copy_len;
 
-static char root_node_search[SEARCH_TERM_MAX_LEN];
-struct window_split_node root_node = {.mode = WINDOW_SINGULAR, .search = root_node_search};
-struct window_split_node* focused_node = &root_node;
-struct window_buffer* focused_window = &root_node.window;
-
-Atom xtarget;
-char* copy_buffer;
-int copy_len;
 TermWindow win;
-DC dc;
 XWindow xw;
+DC dc;
 
 // Fontcache is an array. A new font will be appended to the array.
-int frccap = 0;
 Fontcache *frc = NULL;
+int frccap = 0;
 int frclen = 0;
 double defaultfontsize = 0;
 double usedfontsize = 0;
@@ -163,156 +203,170 @@ double usedfontsize = 0;
 // function implementations
 //
 
-struct file_buffer*
-get_file_buffer(struct window_buffer* buf)
+void
+screen_init(int col, int row)
 {
-	assert(buf);
-	assert(file_buffers);
+	global_attr = default_attributes;
 
-	if (buf->buffer_index < 0)
-		buf->buffer_index = available_buffer_slots-1;
-	else if (buf->buffer_index >= available_buffer_slots)
-		buf->buffer_index = 0;
-
-	if (!file_buffers[buf->buffer_index].contents) {
-		for(int n = buf->buffer_index; n < available_buffer_slots; n++) {
-			if (file_buffers[n].contents) {
-				buf->buffer_index = n;
-				assert(file_buffers[n].contents);
-				return &file_buffers[n];
-			}
-		}
-		for(int n = 0; n < available_buffer_slots; n++) {
-			if (file_buffers[n].contents) {
-				buf->buffer_index = n;
-				assert(file_buffers[n].contents);
-				return &file_buffers[n];
-			}
-		}
-	} else {
-		assert(file_buffers[buf->buffer_index].contents);
-		return &file_buffers[buf->buffer_index];
-	}
-
-	buf->buffer_index = new_file_buffer_entry(NULL);
-	writef_to_status_bar("all buffers were somehow deleted, creating new one");
-	return get_file_buffer(buf);
+	screen.col = 0;
+	screen.row = 0;
+	screen.lines = NULL;
+	screen_resize(col, row);
 }
 
-
-int
-open_seproj(struct file_buffer fb)
+void
+draw_horisontal_line(int y, int x1, int x2)
 {
-	int first = -1;
+	if (y < 0 || y > screen.row ||
+		x2 < x1 || x2 > screen.col ||
+		x1 < 0 || x1 > x2-1)
+		return;
 
-	char* path = file_path_get_path(fb.file_path);
-	chdir(path);
+	Color drawcol = dc.col[default_attributes.fg];
+	XftDrawRect(xw.draw, &drawcol,
+				border_px + x1 * win.cw, border_px + (y + 1) * win.ch - cursor_thickness,
+				win.cw * (x2-x1+1), 1);
+}
 
-	int offset = -1;
-	while((offset = buffer_seek_char(&fb, offset+1, '\n')) >= 0) {
-		char* line = buffer_get_line_at_offset(&fb, offset);
-		if (strlen(line) && !is_file_type(line, ".seproj")) {
-			if (first < 0)
-				first = new_file_buffer_entry(line);
-			else
-				new_file_buffer_entry(line);
-		}
-		free(line);
-	}
+void
+set_clipboard_copy(char* buffer, int len)
+{
+	if (!buffer)
+		return;
+	if (copy_buffer)
+		free(copy_buffer);
+	copy_buffer = buffer;
+	copy_len = len;
 
-	if (first < 0)
-		first = new_file_buffer_entry(NULL);
-	writef_to_status_bar("opened project %s", path);
-	free(path);
+	Atom clipboard;
+	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
+	XSetSelectionOwner(xw.dpy, clipboard, xw.win, CurrentTime);
+}
 
-	buffer_destroy(&fb);
-	return first;
+void
+execute_clipbaord_event()
+{
+	Atom clipboard;
+
+	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
+	XConvertSelection(xw.dpy, clipboard, xtarget, clipboard,
+					  xw.win, CurrentTime);
 }
 
 int
-new_file_buffer_entry(const char* file_path)
+screen_set_char(rune_t u, int x, int y)
 {
-	static char full_path[PATH_MAX];
-	if (!file_path)
-		file_path = "./";
-	assert(strlen(file_path) < PATH_MAX);
-
-	char* res = realpath(file_path, full_path);
-
-	if (available_buffer_slots) {
-		if (res) {
-			for(int n = 0; n < available_buffer_slots; n++) {
-				if (file_buffers[n].contents) {
-					if (strcmp(file_buffers[n].file_path, full_path) == 0) {
-						writef_to_status_bar("buffer exits");
-						return n;
-					}
-				}
-			}
-		} else {
-			strcpy(full_path, file_path);
-		}
-
-		for(int n = 0; n < available_buffer_slots; n++) {
-			if (!file_buffers[n].contents) {
-				if (is_file_type(full_path, ".seproj"))
-					return open_seproj(buffer_new(full_path));
-				file_buffers[n] = buffer_new(full_path);
-				return n;
-			}
-		}
-	}
-
-	if (is_file_type(full_path, ".seproj"))
-		return open_seproj(buffer_new(full_path));
-
-	available_buffer_slots++;
-	file_buffers = xrealloc(file_buffers, sizeof(struct file_buffer) * available_buffer_slots);
-	file_buffers[available_buffer_slots-1] = buffer_new(full_path);
-
-	return available_buffer_slots-1;
-}
-
-int
-destroy_file_buffer_entry(struct window_split_node* node, struct window_split_node* root)
-{
-	// do not allow deletion of the lst file buffer
-	int n = 0;
-	for(; n < available_buffer_slots; n++)
-		if (file_buffers[n].contents && n != node->window.buffer_index)
-			break;
-	if (n >= available_buffer_slots) {
-		writef_to_status_bar("can't delete last buffer");
-		return 0;
-	}
-
-	if (window_other_nodes_contain_file_buffer(node, root)) {
-		node->window.buffer_index++;
-		node->window = window_buffer_new(node->window.buffer_index);
-		writef_to_status_bar("swapped buffer");
-		return 0;
-	}
-	buffer_destroy(get_file_buffer(&node->window));
-
-	if (node->window.mode == WINDOW_BUFFER_FILE_BROWSER)
-		node->window = window_buffer_new(node->window.cursor_col);
-	else
-		node->window = window_buffer_new(node->window.buffer_index);
-
-	return 1;
-}
-
-int
-delete_selection(struct file_buffer* buf)
-{
-	if (buf->mode & BUFFER_SELECTION_ON) {
-		buffer_remove_selection(buf);
-		buffer_move_cursor_to_selection_start(focused_window);
-		buf->mode &= ~(BUFFER_SELECTION_ON);
+	struct glyph attr = global_attr;
+	if (y >= screen.row || x >= screen.col ||
+		y < 0         || x < 0)
 		return 1;
+
+	if (u == 0)
+		u = screen.lines[y][x].u;
+	int width = wcwidth(u);
+	if (width == -1)
+		width = 1;
+	else if (width > 1)
+		attr.mode |= ATTR_WIDE;
+
+	if (screen.lines[y][x].mode & ATTR_WIDE || attr.mode & ATTR_WIDE) {
+		if (x+1 < screen.col) {
+			screen.lines[y][x+1].u = ' ';
+			screen.lines[y][x+1].mode |= ATTR_WDUMMY;
+		}
+	} else if (screen.lines[y][x].mode & ATTR_WDUMMY && x-1 >= 0) {
+		screen.lines[y][x-1].u = ' ';
+		screen.lines[y][x-1].mode &= ~ATTR_WIDE;
 	}
-	return 0;
+
+	screen.lines[y][x] = attr;
+	screen.lines[y][x].u = u;
+
+	return width;
 }
+
+void*
+xmalloc(size_t len)
+{
+	void *p;
+	if (!(p = malloc(len)))
+		die("malloc: error, reutrned NULL | errno: %s\n", strerror(errno));
+	return p;
+}
+
+void*
+xrealloc(void *p, size_t len)
+{
+	if ((p = realloc(p, len)) == NULL)
+		die("realloc: error, returned NULL | errno: %s\n", strerror(errno));
+	return p;
+}
+
+void
+die(const char *errstr, ...)
+{
+	va_list ap;
+
+	va_start(ap, errstr);
+	vfprintf(stderr, errstr, ap);
+	va_end(ap);
+	assert(0);
+}
+
+////////////////////////////////////////////////
+// X11 and drawing
+//
+
+struct glyph*
+screen_set_attr(int x, int y)
+{
+	static struct glyph dummy;
+	if (y >= screen.row || x >= screen.col ||
+		y < 0         || x < 0)
+		return &dummy;
+
+	return &screen.lines[y][x];
+}
+
+void
+screen_set_region(int x1, int y1, int x2, int y2, rune_t u)
+{
+	for (int y = y1; y <= y2; y++)
+		for (int x = x1; x <= x2; x++)
+			screen_set_char(u, x, y);
+}
+
+void
+screen_resize(int col, int row)
+{
+	if (col < 1 || row < 1) {
+		fprintf(stderr,
+		        "tresize: error resizing to %dx%d\n", col, row);
+		return;
+	}
+
+	// resize to new height
+	for (int i = row; i < screen.row; i++)
+		free(screen.lines[i]);
+
+	screen.lines = xrealloc(screen.lines, row * sizeof(*screen.lines));
+
+	for (int i = screen.row; i < row; i++)
+		screen.lines[i] = NULL;
+
+	// resize each row to new width, zero-pad if needed
+	for (int i = 0; i < row; i++) {
+		screen.lines[i] = xrealloc(screen.lines[i], col * sizeof(struct glyph));
+		memset(screen.lines[i], 0, col * sizeof(struct glyph));
+	}
+
+	// update terminal size
+	screen.col = col;
+	screen.row = row;
+}
+
+
+
 
 void
 propnotify(XEvent *e)
@@ -331,9 +385,9 @@ propnotify(XEvent *e)
 void
 selnotify(XEvent *e)
 {
-	ulong nitems, ofs, rem;
+	unsigned long nitems, ofs, rem;
 	int format;
-	uchar *data, *last, *repl;
+	uint8_t *data, *last, *repl;
 	Atom type, incratom, property = None;
 
 	incratom = XInternAtom(xw.dpy, "INCR", 0);
@@ -390,18 +444,15 @@ selnotify(XEvent *e)
 			*repl++ = '\n';
 		}
 
-		struct file_buffer* fb = get_file_buffer(focused_window);
+		struct file_buffer* fb = get_fb(focused_window);
 		if (fb->contents) {
-			if (fb->mode & BUFFER_SELECTION_ON) {
-				buffer_remove_selection(fb);
-				buffer_move_cursor_to_selection_start(focused_window);
-				fb->mode &= ~(BUFFER_SELECTION_ON);
+			if (fb->mode & FB_SELECTION_ON) {
+				fb_remove_selection(fb);
+				wb_move_cursor_to_selection_start(focused_window);
+				fb->mode &= ~(FB_SELECTION_ON);
 			}
-			int offset = focused_window->cursor_offset;
-			buffer_insert(fb, (char*)data, nitems * format / 8, offset, 1);
-			buffer_move_to_offset(focused_window, offset + (nitems * format / 8), 0);
-			if (buffer_contents_updated)
-				buffer_contents_updated(fb, offset, BUFFER_CONTENT_BIG_CHANGE);
+			call_extension(fb_paste, fb, (char*)data, nitems * format / 8);
+			call_extension(fb_contents_updated, fb, focused_window->cursor_offset, FB_CONTENT_BIG_CHANGE);
 		}
 		XFree(data);
 		/* number of 32-bit chunks returned */
@@ -413,31 +464,6 @@ selnotify(XEvent *e)
 	 * next data chunk in the property.
 	 */
 	XDeleteProperty(xw.dpy, xw.win, (int)property);
-}
-
-void
-set_clipboard_copy(char* buffer, int len)
-{
-	if (!buffer)
-		return;
-	if (copy_buffer)
-		free(copy_buffer);
-	copy_buffer = buffer;
-	copy_len = len;
-
-	Atom clipboard;
-	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
-	XSetSelectionOwner(xw.dpy, clipboard, xw.win, CurrentTime);
-}
-
-void
-insert_clipboard_at_cursor()
-{
-	Atom clipboard;
-
-	clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
-	XConvertSelection(xw.dpy, clipboard, xtarget, clipboard,
-					  xw.win, CurrentTime);
 }
 
 void
@@ -465,7 +491,7 @@ selrequest(XEvent *e)
 		string = xtarget;
 		XChangeProperty(xsre->display, xsre->requestor, xsre->property,
 						XA_ATOM, 32, PropModeReplace,
-						(uchar *) &string, 1);
+						(uint8_t *) &string, 1);
 		xev.property = xsre->property;
 	} else if (xsre->target == xtarget || xsre->target == XA_STRING) {
 		/*
@@ -475,7 +501,7 @@ selrequest(XEvent *e)
 		clipboard = XInternAtom(xw.dpy, "CLIPBOARD", 0);
 		int sel_len;
 		if (xsre->selection == XA_PRIMARY) {
-			seltext = buffer_get_selection(get_file_buffer(focused_window), &sel_len);
+			seltext = fb_get_selection(get_fb(focused_window), &sel_len);
 		} else if (xsre->selection == clipboard) {
 			seltext = copy_buffer;
 			sel_len = copy_len;
@@ -489,7 +515,7 @@ selrequest(XEvent *e)
 			XChangeProperty(xsre->display, xsre->requestor,
 							xsre->property, xsre->target,
 							8, PropModeReplace,
-							(uchar *)seltext, sel_len);
+							(uint8_t *)seltext, sel_len);
 			xev.property = xsre->property;
 			if (seltext != copy_buffer)
 				free(seltext);
@@ -506,9 +532,9 @@ cresize(int width, int height)
 {
 	int col, row;
 
-	if (width != 0)
+	if (width > 0)
 		win.w = width;
-	if (height != 0)
+	if (height > 0)
 		win.h = height;
 
 	col = (win.w - 2 * border_px) / win.cw;
@@ -516,7 +542,7 @@ cresize(int width, int height)
 	col = MAX(1, col);
 	row = MAX(1, row);
 
-	tresize(col, row);
+	screen_resize(col, row);
 	xresize(col, row);
 }
 
@@ -662,7 +688,7 @@ xloadfont(Font *f, FcPattern *pattern)
 	/*
 	 * Manually configure instead of calling XftMatchFont
 	 * so that we can use the configured pattern for
-	 * "missing glyph" lookups.
+	 * "missing struct glyph" lookups.
 	 */
 	configured = FcPatternDuplicate(pattern);
 	if (!configured)
@@ -947,7 +973,7 @@ xinit(int cols, int rows)
 
 	xw.netwmpid = XInternAtom(xw.dpy, "_NET_WM_PID", False);
 	XChangeProperty(xw.dpy, xw.win, xw.netwmpid, XA_CARDINAL, 32,
-					PropModeReplace, (uchar *)&thispid, 1);
+					PropModeReplace, (uint8_t *)&thispid, 1);
 
 	win.mode = MODE_NUMLOCK;
 	xsettitle(NULL);
@@ -961,14 +987,14 @@ xinit(int cols, int rows)
 }
 
 int
-xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x, int y)
+xmakeglyphfontspecs(XftGlyphFontSpec *specs, const struct glyph *glyphs, int len, int x, int y)
 {
 	float winx = border_px + x * win.cw, winy = border_px + y * win.ch, xp, yp;
-	ushort mode, prevmode = USHRT_MAX;
+	unsigned short mode, prevmode = USHRT_MAX;
 	Font *font = &dc.font;
 	int frcflags = FRC_NORMAL;
 	float runewidth = win.cw;
-	Rune rune;
+	rune_t rune;
 	FT_UInt glyphidx;
 	FcResult fcres;
 	FcPattern *fcpattern, *fontpattern;
@@ -977,7 +1003,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 	int i, f, numspecs = 0;
 
 	for (i = 0, xp = winx, yp = winy + font->ascent; i < len; ++i) {
-		/* Fetch rune and mode for current glyph. */
+		/* Fetch rune and mode for current struct glyph. */
 		rune = glyphs[i].u;
 		mode = glyphs[i].mode;
 
@@ -985,7 +1011,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 		if (mode & ATTR_WDUMMY)
 			continue;
 
-		/* Determine font for glyph if different from previous glyph. */
+		/* Determine font for struct glyph if different from previous struct glyph. */
 		if (prevmode != mode) {
 			prevmode = mode;
 			font = &dc.font;
@@ -1022,7 +1048,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 			/* Everything correct. */
 			if (glyphidx && frc[f].flags == frcflags)
 				break;
-			/* We got a default font for a not found glyph. */
+			/* We got a default font for a not found struct glyph. */
 			if (!glyphidx && frc[f].flags == frcflags
 				&& frc[f].unicodep == rune) {
 				break;
@@ -1093,7 +1119,7 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 }
 
 void
-xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, int y)
+xdrawglyphfontspecs(const XftGlyphFontSpec *specs, struct glyph base, int len, int x, int y)
 {
 	int charlen = len * ((base.mode & ATTR_WIDE) ? 2 : 1);
 	int winx = border_px + x * win.cw, winy = border_px + y * win.ch,
@@ -1199,7 +1225,7 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 }
 
 void
-xdrawglyph(Glyph g, int x, int y)
+xdrawglyph(struct glyph g, int x, int y)
 {
 	int numspecs;
 	XftGlyphFontSpec spec;
@@ -1211,9 +1237,9 @@ xdrawglyph(Glyph g, int x, int y)
 void
 xdrawcursor(int cx, int cy, int focused)
 {
-	LIMIT(cx, 0, term.col-1);
-	LIMIT(cy, 0, term.row-1);
-	Glyph g = term.line[cy][cx];
+	LIMIT(cx, 0, screen.col-1);
+	LIMIT(cy, 0, screen.row-1);
+	struct glyph g = screen.lines[cy][cx];
 	if (IS_SET(MODE_HIDE)) return;
 
 	g.mode &= ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE;
@@ -1222,8 +1248,8 @@ xdrawcursor(int cx, int cy, int focused)
 	Color drawcol = dc.col[g.bg];
 
 	/* draw the new one */
-	if (IS_SET(MODE_FOCUSED) && !(get_file_buffer(focused_window)->mode & BUFFER_SELECTION_ON) && focused) {
-		switch (win.cursor) {
+	if (IS_SET(MODE_FOCUSED) && !(get_fb(focused_window)->mode & FB_SELECTION_ON) && focused) {
+		switch (cursor_shape) {
 		case 0: // Blinking Block
 		case 1: // Blinking Block (Default)
 		case 2: // Steady Block
@@ -1266,20 +1292,6 @@ xdrawcursor(int cx, int cy, int focused)
 }
 
 void
-draw_horisontal_line(int y, int x1, int x2)
-{
-	if (y < 0 || y > term.row ||
-		x2 < x1 || x2 > term.col ||
-		x1 < 0 || x1 > x2-1)
-		return;
-
-	Color drawcol = dc.col[default_attributes.fg];
-	XftDrawRect(xw.draw, &drawcol,
-				border_px + x1 * win.cw, border_px + (y + 1) * win.ch - cursor_thickness,
-				win.cw * (x2-x1+1), 1);
-}
-
-void
 xseticontitle(char *p)
 {
 	XTextProperty prop;
@@ -1310,12 +1322,12 @@ xsettitle(char *p)
 void
 xdrawline(int x1, int y1, int x2)
 {
-	LIMIT(y1, 0, term.row);
-	LIMIT(x2, 0, term.col);
+	LIMIT(y1, 0, screen.row);
+	LIMIT(x2, 0, screen.col);
 	LIMIT(x1, 0, x2);
-	Line line = term.line[y1];
+	struct glyph* line = screen.lines[y1];
 	int i, x, ox, numspecs;
-	Glyph base, new;
+	struct glyph base, new;
 	XftGlyphFontSpec *specs = xw.specbuf;
 
 	numspecs = xmakeglyphfontspecs(specs, &line[x1], x2 - x1, x1, y1);
@@ -1369,13 +1381,6 @@ xsetpointermotion(int set)
 	XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask, &xw.attrs);
 }
 
-int xsetcursor(int cursor) {
-	if (!BETWEEN(cursor, 0, 7)) /* 7: st extension */
-		return 1;
-	win.cursor = cursor;
-	return 0;
-}
-
 void xseturgency(int add) {
 	XWMHints *h = XGetWMHints(xw.dpy, xw.win);
 	MODBIT(h->flags, add, XUrgencyHint);
@@ -1399,9 +1404,9 @@ xunloadfonts(void)
 void
 xunloadfont(Font *f)
 {
-	assert(f);
-	assert(f->match);
-	assert(f->pattern);
+	soft_assert(f, return;);
+	soft_assert(f->match, return;);
+	soft_assert(f->pattern, return;);
 	XftFontClose(xw.dpy, f->match);
 	FcPatternDestroy(f->pattern);
 	if (f->set)
@@ -1429,263 +1434,17 @@ focus(XEvent *ev)
 }
 
 int
-file_browser_actions(KeySym keysym, int modkey)
-{
-	static char full_path[PATH_MAX];
-	struct file_buffer* fb = get_file_buffer(focused_window);
-	int offset = fb->len;
-
-	switch (keysym) {
-		float new_font_size;
-		int new_fb;
-	case XK_BackSpace:
-		if (offset <= 0) {
-			char* dest = strrchr(fb->file_path, '/');
-			if (dest && dest != fb->file_path) *dest = 0;
-			return 1;
-		}
-
-		focused_window->cursor_offset = offset;
-		buffer_move_on_line(focused_window, -1, 0);
-		offset = focused_window->cursor_offset;
-
-		buffer_remove(fb, offset, 1, 0, 0);
-		focused_node->selected = 0;
-		return 1;
-	case XK_Tab:
-	case XK_Return:
-	{
-		char* path = file_path_get_path(fb->file_path);
-		buffer_change(fb, "\0", 1, fb->len, 1);
-		if (fb->len > 0) fb->len--;
-
-		file_browser_next_item(NULL, NULL, NULL, NULL, NULL);
-		const char* filename;
-		for (int y = 0; (filename = file_browser_next_item(path, fb->contents, NULL, NULL, NULL)); y++) {
-			strcpy(full_path, path);
-			strcat(full_path, filename);
-			if (y == focused_node->selected) {
-				if (path_is_folder(full_path)) {
-					strcpy(fb->file_path, full_path);
-
-					fb->len = 0;
-					fb->contents[0] = '\0';
-					focused_node->selected = 0;
-
-					free(path);
-					file_browser_next_item(NULL, NULL, NULL, NULL, NULL);
-					*full_path = 0;
-					return 1;
-				}
-				goto open_file;
-			}
-		}
-
-		if (fb->contents[fb->len-1] == '/') {
-			free(path);
-			*full_path = 0;
-			return 1;
-		}
-
-		strcpy(full_path, path);
-		strcat(full_path, fb->contents);
-open_file:
-		new_fb = new_file_buffer_entry(full_path);
-		destroy_file_buffer_entry(focused_node, &root_node);
-		focused_node->window = window_buffer_new(new_fb);
-		free(path);
-		*full_path = 0;
-		return 1;
-	}
-	case XK_Down:
-		focused_node->selected++;
-		return 1;
-	case XK_Up:
-		focused_node->selected--;
-		if (focused_node->selected < 0)
-			focused_node->selected = 0;
-		return 1;
-	case XK_Escape:
-		if (destroy_file_buffer_entry(focused_node, &root_node))
-			writef_to_status_bar("file browser clsoed");
-		return 1;
-
-	case XK_Page_Down:
-		new_font_size = usedfontsize-1.0;
-		goto set_fontsize;
-	case XK_Page_Up:
-		new_font_size = usedfontsize+1.0;
-		goto set_fontsize;
-	case XK_Home:
-		new_font_size = defaultfontsize;
-	set_fontsize:
-		xunloadfonts();
-		xloadfonts(fontconfig, new_font_size);
-		cresize(0, 0);
-		xhints();
-		return 1;
-	}
-	return 0;
+match(unsigned int mask, unsigned int state) {
+	const unsigned int ignoremod = Mod2Mask|XK_SWITCH_MOD;
+	return mask == XK_ANY_MOD || mask == (state & ~ignoremod);
 }
 
-void
-file_browser_string_insert(const char* buf, int buflen)
-{
-	static char full_path[PATH_MAX];
-	struct file_buffer* fb = get_file_buffer(focused_window);
-
-	if (fb->len + buflen + strlen(fb->file_path) > PATH_MAX)
-		return;
-
-	if (buf[0] >= 32 || buflen > 1) {
-		buffer_insert(fb, buf, buflen, fb->len, 0);
-		focused_node->selected = 0;
-
-		if (*buf == '/') {
-			buffer_change(fb, "\0", 1, fb->len, 0);
-			if (fb->len > 0) fb->len--;
-			char* path = file_path_get_path(fb->file_path);
-			strcpy(full_path, path);
-			strcat(full_path, fb->contents);
-
-			free(path);
-
-			if (path_is_folder(full_path)) {
-				file_browser_actions(XK_Return, 0);
-				return;
-			}
-		}
-	} else {
-		writef_to_status_bar("unhandled control character 0x%x\n", buf[0]);
-	}
-}
-
-int
-buffer_search_actions(KeySym keysym, int modkey)
-{
-	switch (keysym) {
-	case XK_Return:
-	case XK_Tab:
-		if (focused_window->mode == WINDOW_BUFFER_KEYWORD_ALL_BUFFERS) {
-			struct keyword_pos kw;
-			int n = 0;
-			buffers_search_keyword_next_item(NULL, NULL, NULL, NULL, NULL);
-			while (buffers_search_keyword_next_item("", focused_node->search, NULL, NULL, &kw)) {
-				if (n == focused_node->selected) {
-					*focused_window = window_buffer_new(kw.buffer_index);
-					focused_window->cursor_offset = kw.offset;
-					return 1;
-				}
-				n++;
-			}
-			buffers_search_keyword_next_item(NULL, NULL, NULL, NULL, NULL);
-		} else if (focused_window->mode == WINDOW_BUFFER_SEARCH_BUFFERS) {
-			int buffer_index;
-			int n = 0;
-			buffer_search_next_item(NULL, NULL, NULL, NULL, NULL);
-			while (buffer_search_next_item("", focused_node->search, NULL, NULL, &buffer_index)) {
-				if (n == focused_node->selected) {
-					*focused_window = window_buffer_new(buffer_index);
-					return 1;
-				}
-				n++;
-			}
-			buffer_search_next_item(NULL, NULL, NULL, NULL, NULL);
-		}
-		puts("n");
-		return 1;
-	case XK_BackSpace:
-		remove_utf8_string_end(focused_node->search);
-		focused_node->selected = 0;
-		return 1;
-	case  XK_Down:
-		focused_node->selected++;
-		return 1;
-	case  XK_Up:
-		focused_node->selected--;
-		if (focused_node->selected < 0)
-			focused_node->selected = 0;
-		return 1;
-	case  XK_Page_Down:
-		focused_node->selected += 10;
-		return 1;
-	case  XK_Page_Up:
-		focused_node->selected -= 10;
-		if (focused_node->selected < 0)
-			focused_node->selected = 0;
-		return 1;
-	case XK_Escape:
-		if (path_is_folder(get_file_buffer(focused_window)->file_path))
-			focused_window->mode = WINDOW_BUFFER_FILE_BROWSER;
-		else
-			focused_window->mode = WINDOW_BUFFER_NORMAL;
-		return 1;
-	}
-	return 0;
-}
-
-void
-buffer_search_string_insert(const char* buf, int buflen)
-{
-	int len = strlen(focused_node->search);
-	if (buflen + len + 1 > SEARCH_TERM_MAX_LEN)
-		return;
-
-	if (buf[0] >= 32 || buflen > 1) {
-		memcpy(focused_node->search + len, buf, buflen);
-		focused_node->search[len + buflen] = 0;
-		focused_node->selected = 0;
-	} else {
-		writef_to_status_bar("unhandled control character 0x%x\n", buf[0]);
-	}
-}
-
-int
-search_term_actions(KeySym keysym, int modkey)
-{
-	static int first = 0;
-	struct file_buffer* fb = get_file_buffer(focused_window);
-	if (keysym == XK_Return || keysym == XK_Escape) {
-		int count = buffer_count_string_instances(fb, fb->search_term, 0, NULL);
-		if (!count) {
-			fb->mode &= ~BUFFER_SEARCH_BLOCKING_MASK;
-			writef_to_status_bar("no resulrs for \"%s\"", fb->search_term);
-		} else {
-			fb->mode &= ~BUFFER_SEARCH_BLOCKING;
-			fb->mode &= ~BUFFER_SEARCH_BLOCKING_BACKWARDS;
-			fb->mode |= BUFFER_SEARCH_BLOCKING_IDLE;
-
-			writef_to_status_bar("%d results for \"%s\"", count, fb->search_term);
-			if (fb->mode & BUFFER_SEARCH_BLOCKING_BACKWARDS)
-				focused_window->cursor_offset = buffer_seek_string_backwards(fb, focused_window->cursor_offset, fb->search_term);
-			else
-				focused_window->cursor_offset = buffer_seek_string(fb, focused_window->cursor_offset, fb->search_term);
-		}
-		first = 1;
-		search_term_string_insert(NULL, 0);
-		return 1;
-	}
-	if (keysym == XK_BackSpace) {
-		if (first) {
-			first = 0;
-			*fb->search_term = 0;
-		} else {
-			remove_utf8_string_end(fb->search_term);
-			focused_window->cursor_offset = buffer_seek_string_wrap(focused_window, focused_window->cursor_offset, fb->search_term);
-		}
-		writef_to_status_bar("search: %s", fb->search_term);
-		return 1;
-	}
-	first = 0;
-	return 0;
-}
-
-void
+static void
 search_term_string_insert(const char* buf, int buflen)
 {
 	static int first = 0;
 
-	struct file_buffer* fb = get_file_buffer(focused_window);
+	struct file_buffer* fb = get_fb(focused_window);
 	if (!buf) {
 		first = 1;
 		return;
@@ -1700,18 +1459,55 @@ search_term_string_insert(const char* buf, int buflen)
 			return;
 		memcpy(fb->search_term + len, buf, buflen);
 		fb->search_term[len + buflen] = 0;
-		if (fb->mode & BUFFER_SEARCH_BLOCKING_BACKWARDS)
-			focused_window->cursor_offset = buffer_seek_string_backwards(fb, focused_window->cursor_offset, fb->search_term);
+		if (fb->mode & FB_SEARCH_BLOCKING_BACKWARDS)
+			focused_window->cursor_offset = fb_seek_string_backwards(fb, focused_window->cursor_offset, fb->search_term);
 		else
-			focused_window->cursor_offset = buffer_seek_string(fb, focused_window->cursor_offset, fb->search_term);
+			focused_window->cursor_offset = fb_seek_string(fb, focused_window->cursor_offset, fb->search_term);
 		writef_to_status_bar("search: %s", fb->search_term);
 	}
 }
 
-int match(uint mask, uint state) {
-	const uint ignoremod = Mod2Mask|XK_SWITCH_MOD;
-	return mask == XK_ANY_MOD || mask == (state & ~ignoremod);
+
+static int
+search_term_actions(KeySym keysym, int modkey)
+{
+	static int first = 0;
+	struct file_buffer* fb = get_fb(focused_window);
+	if (keysym == XK_Return || keysym == XK_Escape) {
+		int count = fb_count_string_instances(fb, fb->search_term, 0, NULL);
+		if (!count) {
+			fb->mode &= ~FB_SEARCH_BLOCKING_MASK;
+			writef_to_status_bar("no resulrs for \"%s\"", fb->search_term);
+		} else {
+			fb->mode &= ~FB_SEARCH_BLOCKING;
+			fb->mode &= ~FB_SEARCH_BLOCKING_BACKWARDS;
+			fb->mode |= FB_SEARCH_BLOCKING_IDLE;
+
+			writef_to_status_bar("%d results for \"%s\"", count, fb->search_term);
+			if (fb->mode & FB_SEARCH_BLOCKING_BACKWARDS)
+				focused_window->cursor_offset = fb_seek_string_backwards(fb, focused_window->cursor_offset, fb->search_term);
+			else
+				focused_window->cursor_offset = fb_seek_string(fb, focused_window->cursor_offset, fb->search_term);
+		}
+		first = 1;
+		search_term_string_insert(NULL, 0);
+		return 1;
+	}
+	if (keysym == XK_BackSpace) {
+		if (first) {
+			first = 0;
+			*fb->search_term = 0;
+		} else {
+			utf8_remove_string_end(fb->search_term);
+			focused_window->cursor_offset = wb_seek_string_wrap(focused_window, focused_window->cursor_offset, fb->search_term);
+		}
+		writef_to_status_bar("search: %s", fb->search_term);
+		return 1;
+	}
+	first = 0;
+	return 0;
 }
+
 
 void
 kpress(XEvent *ev)
@@ -1720,54 +1516,46 @@ kpress(XEvent *ev)
 	KeySym ksym;
 	char buf[64];
 	int len;
-	Rune c;
+	rune_t c;
 	Status status;
 
 	if (IS_SET(MODE_KBDLOCK))
 		return;
 
 	if (xw.ime.xic)
-		len = XmbLookupString(xw.ime.xic, e, buf, sizeof buf, &ksym, &status);
+		len = XmbLookupString(xw.ime.xic, e, buf, sizeof(buf), &ksym, &status);
 	else
-		len = XLookupString(e, buf, sizeof buf, &ksym, NULL);
-	const struct file_buffer* fb = get_file_buffer(focused_window);
+		len = XLookupString(e, buf, sizeof(buf), &ksym, NULL);
+	if (len == 1 && e->state & Mod1Mask) {
+		if (*buf < 0177) {
+			c = *buf | 0x80;
+			len = utf8_encode(c, buf);
+		}
+	}
 
+	const struct file_buffer* fb = get_fb(focused_window);
 	// keysym callback
-	if (focused_window->mode == WINDOW_BUFFER_FILE_BROWSER) {
-		if (file_browser_actions(ksym, e->state))
-			return;
-	} else if (focused_window->mode & WINDOW_BUFFER_SEARCH_BUFFERS ||
-			   focused_window->mode & WINDOW_BUFFER_KEYWORD_ALL_BUFFERS) {
-		if (buffer_search_actions(ksym, e->state))
-			return;
-	} else if (fb->mode & BUFFER_SEARCH_BLOCKING) {
+	if (fb->mode & FB_SEARCH_BLOCKING) {
 		if (search_term_actions(ksym, e->state))
 			return;
-	} else if (keypress_callback) {
-		if (keypress_callback(ksym, e->state))
-			return;
+	}
+	if (fb->mode & FB_SEARCH_BLOCKING) {
+		search_term_string_insert(buf, len);
+		return;
 	}
 
-	// composed string from input method and send to callback
-	if (string_input_callback) {
-		if (len == 0)
+	if (focused_window->mode != WB_NORMAL) {
+		int override = 0;
+		call_extension(wn_custom_window_keypress_override, &override, focused_node, ksym, e->state, buf, len);
+		if (override)
 			return;
-		if (len == 1 && e->state & Mod1Mask) {
-			if (*buf < 0177) {
-				c = *buf | 0x80;
-				len = utf8encode(c, buf);
-			}
-		}
-		if (focused_window->mode == WINDOW_BUFFER_FILE_BROWSER)
-			file_browser_string_insert(buf, len);
-		else if (focused_window->mode & WINDOW_BUFFER_SEARCH_BUFFERS ||
-				 focused_window->mode & WINDOW_BUFFER_KEYWORD_ALL_BUFFERS)
-			buffer_search_string_insert(buf, len);
-		else if (fb->mode & BUFFER_SEARCH_BLOCKING)
-			search_term_string_insert(buf, len);
-		else
-			string_input_callback(buf, len);
+
+		int wn_custom_window_keypress_override_callback_exists = 0;
+		extension_callback_exists(wn_custom_window_keypress_override, wn_custom_window_keypress_override_callback_exists = 1;);
+		soft_assert(wn_custom_window_keypress_override_callback_exists, );
 	}
+
+	call_extension(keypress, ksym, e->state, buf, len);
 }
 
 void
@@ -1794,7 +1582,7 @@ resize(XEvent *e)
 		return;
 
 	cresize(e->xconfigure.width, e->xconfigure.height);
-	writef_to_status_bar("window resize: %d:%d", term.col, term.row);
+	writef_to_status_bar("window resize: %d:%d", screen.col, screen.row);
 }
 
 void
@@ -1822,6 +1610,7 @@ run(void)
 	cresize(w, h);
 
 	for (;;) {
+		struct timespec ts_start;
 
 		int xev = 0;
 		while (XPending(xw.dpy)) {
@@ -1829,6 +1618,7 @@ run(void)
 			if (XFilterEvent(&ev, None))
 				continue;
 			if (handler[ev.type]) {
+				clock_gettime(CLOCK_MONOTONIC, &ts_start);
 				(handler[ev.type])(&ev);
 				xev = 1;
 			}
@@ -1839,42 +1629,39 @@ run(void)
 			continue;
 		}
 
-		tsetregion(0, 0, term.col-1, term.row-1, ' ');
-		if (term.row-2 >= 0)
-			window_draw_tree_to_screen(&root_node, 0, 0, term.col-1, term.row-1);
+		screen_set_region(0, 0, screen.col-1, screen.row-1, ' ');
+		if (screen.row-2 >= 0)
+			window_node_draw_tree_to_screen(&root_node, 0, 0, screen.col-1, screen.row-1);
 		draw_status_bar();
-
-		if (draw_callback)
-			draw_callback();
 
 		xfinishdraw();
 		XFlush(xw.dpy);
+
+		struct timespec ts_end;
+		clock_gettime(CLOCK_MONOTONIC, &ts_end);
+		double dif = 0;
+		dif = (ts_end.tv_sec - ts_start.tv_sec) * 1e6;
+		dif += (ts_end.tv_nsec - ts_start.tv_nsec) * 1e-3;
+		printf("%lf\n", dif);
 	}
 }
 
 int
 main(int argc, char *argv[])
 {
-	if (startup_callback) {
-		startup_callback();
-	}
 	xw.l = xw.t = 0;
 	xw.isfixed = False;
-	xsetcursor(cursor_shape);
 
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
 	int cols = MAX(default_cols, 1);
 	int rows = MAX(default_rows, 1);
-	tnew(cols, rows);
+	screen_init(cols, rows);
 	xinit(cols, rows);
 	xsetenv();
-	// TODO: fix things when the file buffer is empty
-	// for example on a new file
-
 
 	if (argc <= 1) {
-		*focused_window = window_buffer_new(new_file_buffer_entry(NULL));
+		*focused_window = wb_new(fb_new_entry(NULL));
 	} else  {
 		int master_stack = 1;
 		for (int i = 1; i < argc; i++) {
@@ -1885,7 +1672,7 @@ main(int argc, char *argv[])
 					window_node_split(focused_node, 0.5, WINDOW_HORISONTAL);
 					master_stack = 0;
 				} else if (master_stack > 0) {
-					*focused_window = window_buffer_new(new_file_buffer_entry(argv[i]));
+					*focused_window = wb_new(fb_new_entry(argv[i]));
 					master_stack = -1;
 					continue;
 				} else {
@@ -1894,23 +1681,27 @@ main(int argc, char *argv[])
 
 				if (focused_node->node2) {
 					focused_node = focused_node->node2;
-					focused_window = &focused_node->window;
+					focused_window = &focused_node->wb;
 					if (!master_stack)
-						*focused_window = window_buffer_new(new_file_buffer_entry(argv[i]));
+						*focused_window = wb_new(fb_new_entry(argv[i]));
 				}
 				master_stack = 0;
 			}
 		}
 	}
 
-	static const char* const welcome[] = {"Welcome to se!", "Good day, Human", "Happy Coding", "se: the Simple Editor",
-		"Time to get some progress done!", "Ready for combat", "Initialising...Done",  "loaded in %%d seconds",
-		"Fun fact: vscode has over two times as many lines describing dependencies than se has in total",
-		"You look based", "Another day, another bug to fix", "Who needs a mouse ¯\\_(ツ)_/¯", "grrgrrggghhaaaaaa (╯°□ °）╯︵ ┻━┻",
-		"┬┴┬┤(･_├┬┴┬┤├┬┴┬┴┬┤ʖ ͡°) ├┬┴┬┴┬┴┬┴┬┴┬┴┬┴┬┴┬┴┬┴", "ʰᵉˡˡᵒ", "(=^ ◡ ^=)"};
-
 	srand(time(NULL));
-	writef_to_status_bar(welcome[rand() % LEN(welcome)]);
+
+	// TODO: start screen extension
+
+	if (extensions) {
+		for (int i = 0; !extensions[i].end; i++) {
+			if (extensions[i].e.init)
+				extensions[i].e.init(&extensions[i].e);
+			if (extensions[i].e.enable)
+				extensions[i].e.enable();
+		}
+	}
 
 	run();
 

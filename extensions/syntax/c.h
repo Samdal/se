@@ -4,7 +4,7 @@
 #define color_macro(_str)	{COLOR_WORD,{_str},  macro_color}
 #endif
 
-const struct color_scheme_entry c_color_scheme[] =  {
+const struct syntax_scheme_entry c_syntax[] =  {
 	// Coloring type           arguments       Color
 
 	// strings
@@ -28,11 +28,12 @@ const struct color_scheme_entry c_color_scheme[] =  {
 	{COLOR_STR_AFTER_WORD,    {"#define"},    constants_color},
 	{COLOR_STR_AFTER_WORD,    {"#undef"},     constants_color},
 #endif // constants_color
+#ifdef string_color
+	{COLOR_INSIDE_TO_LINE,    {"#error ", "\n"}, string_color},
+#endif // string_color
 	{COLOR_WORD_STARTING_WITH_STR, {"#"},     {.fg = yellow, .mode = ATTR_BOLD}},
 	color_macro("sizeof"),   color_macro("alignof"),
-	color_macro("offsetof"), color_macro("va_arg"),
-	color_macro("va_start"), color_macro("va_end"),
-	color_macro("va_copy"),
+	color_macro("offsetof"),
 	{COLOR_STR_AFTER_WORD,    {"defined"},       constants_color},
 	color_macro("defined"),
 #endif
@@ -90,12 +91,35 @@ const struct color_scheme_entry c_color_scheme[] =  {
 #endif
 	// numbers
 #ifdef number_color
-	color_number("0"), color_number("1"),
-	color_number("2"), color_number("3"),
-	color_number("4"), color_number("5"),
-	color_number("6"), color_number("7"),
-	color_number("8"), color_number("9"),
+	color_numbers(),
 #endif
 };
 
 #define c_word_seperators default_word_seperators
+
+const struct indent_scheme_entry c_indent[] = {
+	{INDENT_REMOVE,      INDENT_LINE_CONTAINS_STR_MORE_THAN_STR,  0, {"}", "{"} },
+	{INDENT_NEW,         INDENT_LINE_CONTAINS_STR_MORE_THAN_STR, -1, {"{", "}"} },
+
+	{INDENT_NEW,         INDENT_LINE_ONLY_CONTAINS_STR,          -1, {"("}      },
+	{INDENT_KEEP_OPENER, INDENT_LINE_CONTAINS_STR_MORE_THAN_STR, -1, {"(", ")"} },
+	{INDENT_REMOVE,      INDENT_LINE_ONLY_CONTAINS_STR,           0, {")"}      },
+	{INDENT_REMOVE,      INDENT_LINE_ONLY_CONTAINS_STR,           0, {");"}     },
+	{INDENT_RETURN_TO_OPENER_BASE_INDENT, INDENT_LINE_CONTAINS_STR_MORE_THAN_STR, -1, {")", "("} },
+
+	{INDENT_NEW,         INDENT_LINE_ONLY_CONTAINS_STR,          -1, {"["}      },
+	{INDENT_REMOVE,      INDENT_LINE_ONLY_CONTAINS_STR,           0, {"]"}      },
+	{INDENT_REMOVE,      INDENT_LINE_ONLY_CONTAINS_STR,           0, {"];"}     },
+	{INDENT_KEEP_OPENER, INDENT_LINE_CONTAINS_STR_MORE_THAN_STR, -1, {"[", "]"} },
+	{INDENT_RETURN_TO_OPENER_BASE_INDENT, INDENT_LINE_CONTAINS_STR_MORE_THAN_STR, -1, {"]", "["} },
+
+	{INDENT_REMOVE,      INDENT_LINE_ENDS_WITH_STR,               0, {":"}   },
+	{INDENT_NEW,         INDENT_LINE_ENDS_WITH_STR,              -1, {":"}   },
+	{INDENT_KEEP,        INDENT_LINE_ENDS_WITH_STR,              -1, {";"}      },
+	{INDENT_KEEP,        INDENT_LINE_CONTAINS_STR_MORE_THAN_STR,  0, {"{", "}"} },
+	{INDENT_NEW,         INDENT_LINE_CONTAINS_WORD,               -1, {"else"}   },
+	{INDENT_NEW,         INDENT_LINE_CONTAINS_WORD,               -1, {"if"}     },
+	{INDENT_NEW,         INDENT_LINE_CONTAINS_WORD,               -1, {"for"}    },
+	{INDENT_NEW,         INDENT_LINE_CONTAINS_WORD,               -1, {"while"}  },
+
+};

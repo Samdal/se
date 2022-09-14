@@ -4,7 +4,7 @@
 
 include config.mk
 
-SRC = se.c x.c config.c
+SRC = se.c x.c config.c buffer.c seek.c utf8.c
 OBJ = $(SRC:.c=.o)
 
 all: options se
@@ -54,4 +54,7 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/se
 #	rm -f $(DESTDIR)$(MANPREFIX)/man1/st.1
 
-.PHONY: all options clean dist install uninstall
+run: all
+	./se
+
+.PHONY: all options clean dist install uninstall run

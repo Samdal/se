@@ -1,18 +1,81 @@
 /* See LICENSE for license details. */
+
+/*
+** This file mainly contains X11 stuff (drawing to the screen, window hints, etc)
+** Most of that part is unchanged from ST (https://st.suckless.org/)
+** the main() function and the main loop are found at the very bottom of this file
+** there are a very few functions here that are interresting for configuratinos.
+*/
+
 #ifndef _X_H
 #define _X_H
 
-#include "se.h"
-#undef Glyph
+#include "utf8.h"
 
-#include <X11/Xatom.h>
 #include <X11/Xlib.h>
-#include <X11/cursorfont.h>
 #include <X11/keysym.h>
-#include <X11/Xft/Xft.h>
-#include <X11/XKBlib.h>
+#include <stdio.h>
+#include <limits.h>
 
-#define Glyph Glyph_
+void draw_horisontal_line(int y, int x1, int x2);
+// TODO: vertical line
+// !!! NOTE:
+// !!! buffer MUST be malloced and NOT be freed after it is passed
+void set_clipboard_copy(char* buffer, int len);
+void execute_clipbaord_event();
+
+enum glyph_attribute {
+	ATTR_NULL       = 0,
+	ATTR_BOLD       = 1 << 0,
+	ATTR_FAINT      = 1 << 1,
+	ATTR_ITALIC     = 1 << 2,
+	ATTR_UNDERLINE  = 1 << 3,
+	ATTR_REVERSE    = 1 << 5,
+	ATTR_INVISIBLE  = 1 << 6,
+	ATTR_STRUCK     = 1 << 7,
+	ATTR_WIDE       = 1 << 9,
+	ATTR_WDUMMY     = 1 << 10,
+	ATTR_BOLD_FAINT = ATTR_BOLD | ATTR_FAINT,
+};
+
+struct glyph {
+	rune_t  u;		// character code
+	uint16_t  mode;	// attribute flags
+	uint32_t fg;	// foreground
+	uint32_t bg;	// background
+};
+
+// Internal representation of the screen
+struct screen {
+	int row;         // row count
+	int col;         // column count
+	struct glyph** lines;   // screen letters 2d array
+};
+
+extern struct screen screen;
+extern struct glyph global_attr;
+
+void screen_init(int col, int row);
+void screen_resize(int col, int row);
+void screen_set_region(int x1, int y1, int x2, int y2, rune_t u);
+int screen_set_char(rune_t u, int x, int y);
+struct glyph* screen_set_attr(int x, int y);
+
+void* xmalloc(size_t len);
+void* xrealloc(void *p, size_t len);
+void die(const char *, ...);
+
+// the va_args can be used to return; or any other stuff like that
+// TODO: optionally crash the program for debugging
+#define soft_assert(condition, ...)										\
+	do {																\
+		if(!(condition)) {												\
+			fprintf(stderr, "SOFT ASSERT ERROR: (%s) failed at %s %s():%d\n", #condition, __FILE__, __func__, __LINE__); \
+			writef_to_status_bar("SOFT ASSERT ERROR: (%s) failed at %s %s():%d", #condition, __FILE__, __func__, __LINE__); \
+			status_bar_bg = error_color;								\
+			__VA_ARGS__													\
+		}																\
+	} while(0)															\
 
 enum win_mode {
 	MODE_VISIBLE     = 1 << 0,
@@ -28,81 +91,24 @@ enum win_mode {
 	MODE_NUMLOCK     = 1 << 17,
 };
 
-// Purely graphic info
-typedef struct {
-	int tw, th;	// tty width and height
-	int w, h;	// window width and height
-	int ch;		// char height
-	int cw;		// char width
-	int mode;	// window state/mode flags
-	int cursor;	// cursor style
-} TermWindow;
+#define MIN(a, b)		((a) < (b) ? (a) : (b))
+#define MAX(a, b)		((a) < (b) ? (b) : (a))
+#define LEN(a)			(sizeof(a) / sizeof(a)[0])
+#define LIMIT(x, a, b)		(x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
+#define BETWEEN(x, a, b)	((a) <= (x) && (x) <= (b))
 
-typedef XftDraw *Draw;
-typedef XftColor Color;
-typedef XftGlyphFontSpec GlyphFontSpec;
+////////////////////////////////////////////////
+// X11 and drawing
+//
 
-typedef struct {
-	Display *dpy;
-	Colormap cmap;
-	Window win;
-	Drawable buf;
-	GlyphFontSpec *specbuf; // font spec buffer used for rendering
-	Atom xembed, wmdeletewin, netwmname, netwmiconname, netwmpid;
-	struct {
-		XIM xim;
-		XIC xic;
-		XPoint spot;
-		XVaNestedList spotlist;
-	} ime;
-	Draw draw;
-	Visual *vis;
-	XSetWindowAttributes attrs;
-	int scr;
-	int isfixed;	// is fixed geometry?
-	int l, t;		// left and top offset
-	int gm;			// geometry mask
-} XWindow;
+// X modifiers
+#define XK_ANY_MOD    UINT_MAX
+#define XK_NO_MOD     0
+#define XK_SWITCH_MOD (1<<13|1<<14)
 
-// Font structure
-#define Font Font_
-typedef struct {
-	int height;
-	int width;
-	int ascent;
-	int descent;
-	int badslant;
-	int badweight;
-	short lbearing;
-	short rbearing;
-	XftFont *match;
-	FcFontSet *set;
-	FcPattern *pattern;
-} Font;
+extern double defaultfontsize;
+extern double usedfontsize;
 
-// Font Ring Cache
-enum {
-	FRC_NORMAL,
-	FRC_ITALIC,
-	FRC_BOLD,
-	FRC_ITALICBOLD
-};
-
-typedef struct {
-	XftFont *font;
-	int flags;
-	Rune unicodep;
-} Fontcache;
-
-// Drawing Context
-typedef struct {
-	Color *col;
-	size_t collen;
-	Font font, bfont, ifont, ibfont;
-	GC gc;
-} DC;
-
-void xclipcopy(void);
 void xdrawcursor(int, int, int focused);
 void xdrawline(int, int, int);
 void xfinishdraw(void);
@@ -110,22 +116,11 @@ void xloadcols(void);
 void xloadfonts(const char *, double);
 int xsetcolorname(int, const char *);
 void xseticontitle(char *);
-int xsetcursor(int);
 void xsetpointermotion(int);
 int xstartdraw(void);
 void xunloadfonts(void);
-void xunloadfont(Font *);
 void cresize(int, int);
 void xhints(void);
-int match(uint, uint);
-
-struct file_buffer* get_file_buffer(struct window_buffer* buf);
-int new_file_buffer_entry(const char* file_path);
-int destroy_file_buffer_entry(struct window_split_node* node, struct window_split_node* root);
-int delete_selection(struct file_buffer* buf);
-void draw_horisontal_line(int y, int x1, int x2);
-// buffer MUST be malloced and NOT be freed after it is passed
-void set_clipboard_copy(char* buffer, int len);
-void insert_clipboard_at_cursor();
+int match(unsigned int, unsigned int);
 
 #endif // _X_H
