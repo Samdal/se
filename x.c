@@ -1610,15 +1610,12 @@ run(void)
         cresize(w, h);
 
         for (;;) {
-                struct timespec ts_start;
-
                 int xev = 0;
                 while (XPending(xw.dpy)) {
                         XNextEvent(xw.dpy, &ev);
                         if (XFilterEvent(&ev, None))
                                 continue;
                         if (handler[ev.type]) {
-                                clock_gettime(CLOCK_MONOTONIC, &ts_start);
                                 (handler[ev.type])(&ev);
                                 xev = 1;
                         }
@@ -1636,13 +1633,6 @@ run(void)
 
                 xfinishdraw();
                 XFlush(xw.dpy);
-
-                struct timespec ts_end;
-                clock_gettime(CLOCK_MONOTONIC, &ts_end);
-                double dif = 0;
-                dif = (ts_end.tv_sec - ts_start.tv_sec) * 1e6;
-                dif += (ts_end.tv_nsec - ts_start.tv_nsec) * 1e-3;
-                printf("%lf\n", dif);
         }
 }
 
