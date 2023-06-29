@@ -1,6 +1,6 @@
 /* See LICENSE for license details. */
-#ifndef _ST_H
-#define _ST_H
+#ifndef _SE_H
+#define _SE_H
 
 #include "utf8.h"
 #include "buffer.h"
@@ -20,4 +20,4 @@ void draw_status_bar();
 
 void window_node_draw_to_screen(struct window_split_node* wn);
 
-#endif // _ST_H
+#endif // _SE_H
