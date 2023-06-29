@@ -24,52 +24,57 @@ extern struct window_buffer* focused_window;
 
 #define UNDO_BUFFERS_COUNT 128
 struct undo_buffer {
-	char* contents; // not null terminated
-	int len, capacity;
-	int cursor_offset;
-	int y_scroll;
+		char* contents; // not null terminated
+		int len, capacity;
+		int cursor_offset;
+		int y_scroll;
 };
 
 enum buffer_flags {
-	FB_SELECTION_ON = 1 << 0,
-	FB_BLOCK_SELECT = 1 << 1,
-	FB_LINE_SELECT  = 1 << 2,
-	FB_SELECT_MASK = (FB_SELECTION_ON | FB_BLOCK_SELECT | FB_LINE_SELECT),
-	FB_SELECT_MODE_MASK = (FB_BLOCK_SELECT | FB_LINE_SELECT),
-	FB_READ_ONLY    = 1 << 3,
-	FB_UTF8_SIGNED  = 1 << 4,
-	FB_SEARCH_BLOCKING       = 1 << 5,
-	FB_SEARCH_BLOCKING_IDLE  = 1 << 6,
-	FB_SEARCH_BLOCKING_MASK = (FB_SEARCH_BLOCKING | FB_SEARCH_BLOCKING_IDLE),
-	FB_SEARCH_NON_BLOCKING   = 1 << 7,
-	FB_SEARCH_BLOCKING_BACKWARDS   = 1 << 8,
-	FB_SEARCH_NON_BLOCKING_BACKWARDS   = 1 << 9,
+		FB_SELECTION_ON = 1 << 0,
+		FB_BLOCK_SELECT = 1 << 1,
+		FB_LINE_SELECT  = 1 << 2,
+		FB_SELECT_MASK = (FB_SELECTION_ON | FB_BLOCK_SELECT | FB_LINE_SELECT),
+		FB_SELECT_MODE_MASK = (FB_BLOCK_SELECT | FB_LINE_SELECT),
+		FB_READ_ONLY    = 1 << 3,
+		FB_UTF8_SIGNED  = 1 << 4,
+		FB_SEARCH_BLOCKING       = 1 << 5,
+		FB_SEARCH_BLOCKING_IDLE  = 1 << 6,
+		FB_SEARCH_BLOCKING_MASK = (FB_SEARCH_BLOCKING | FB_SEARCH_BLOCKING_IDLE),
+		FB_SEARCH_NON_BLOCKING   = 1 << 7,
+		FB_SEARCH_BLOCKING_BACKWARDS   = 1 << 8,
+		FB_SEARCH_NON_BLOCKING_BACKWARDS   = 1 << 9,
 };
 
 struct file_buffer {
-	char* file_path;
-	char* contents; // !! NOT NULL TERMINATED !!
-	int len;
-	int capacity;
-	int mode; // buffer_flags
-	struct undo_buffer* ub;
-	// TODO: int file_buffer_len;
-	int current_undo_buffer;
-	int available_redo_buffers;
-	int s1o, s2o; // selection start offset and end offset
-	char* search_term;
-	char* non_blocking_search_term;
-	int syntax_index;
-	unsigned int indent_len; // amount of spaces, if 0 tab is used
+		char* file_path;
+		char* contents; // !! NOT NULL TERMINATED !!
+		int len;
+		int capacity;
+		int mode; // buffer_flags
+		struct undo_buffer* ub;
+		int current_undo_buffer;
+		int available_redo_buffers;
+		int s1o, s2o; // selection start offset and end offset
+
+		// used for "ctrl+f" searches
+		char* search_term;
+		// used for vim-style f searches
+		char* non_blocking_search_term;
+
+		unsigned int indent_len; // amount of spaces, if 0 tab is used
+
+		// required by syntax.h, not used by anything else
+		int syntax_index;
 };
 
 enum buffer_content_reason {
-	FB_CONTENT_DO_NOT_CALLBACK = 0,
-	FB_CONTENT_OPERATION_ENDED,
-	FB_CONTENT_NORMAL_EDIT,
-	FB_CONTENT_BIG_CHANGE,
-	FB_CONTENT_INIT,
-	FB_CONTENT_CURSOR_MOVE,
+		FB_CONTENT_DO_NOT_CALLBACK = 0,
+		FB_CONTENT_OPERATION_ENDED,
+		FB_CONTENT_NORMAL_EDIT,
+		FB_CONTENT_BIG_CHANGE,
+		FB_CONTENT_INIT,
+		FB_CONTENT_CURSOR_MOVE,
 };
 
 struct file_buffer* get_fb(struct window_buffer* wb);
@@ -118,28 +123,28 @@ void fb_offset_to_xy(struct file_buffer* fb, int offset, int maxx, int y_scroll,
 #define WB_MODES_DEFAULT_END 1
 
 struct window_buffer {
-	int y_scroll;
-	int cursor_offset;
-	int cursor_col;
+		int y_scroll;
+		int cursor_offset;
+		int cursor_col;
 
-	int fb_index; // index into an array storing file buffers
+		int fb_index; // index into an array storing file buffers
 
-    ///////////////////////////////////
-    // you may implement your own "modes"
-    // it will run a callback where you can render your window
-    // a callback allowing you to override the default input callback
-    // is also provided
-    // TODO:↑
-    // see extensions/window_modes for other modes
-	unsigned int mode; // WB_NORMAL = 0
+		///////////////////////////////////
+		// you may implement your own "modes"
+		// it will run a callback where you can render your window
+		// a callback allowing you to override the default input callback
+		// is also provided
+		// TODO:↑
+		// see extensions/window_modes for other modes
+		unsigned int mode; // WB_NORMAL = 0
 };
 
 enum cursor_reason {
-	CURSOR_DO_NOT_CALLBACK = 0,
-	CURSOR_COMMAND_MOVEMENT = 1,
-	CURSOR_UP_DOWN_MOVEMENT,
-	CURSOR_RIGHT_LEFT_MOVEMENT,
-	CURSOR_SNAPPED,
+		CURSOR_DO_NOT_CALLBACK = 0,
+		CURSOR_COMMAND_MOVEMENT = 1,
+		CURSOR_UP_DOWN_MOVEMENT,
+		CURSOR_RIGHT_LEFT_MOVEMENT,
+		CURSOR_SNAPPED,
 };
 
 struct window_buffer wb_new(int buffer_index);
@@ -149,27 +154,27 @@ struct window_buffer wb_new(int buffer_index);
 //
 
 enum window_split_mode {
-	WINDOW_SINGULAR,
-	WINDOW_HORISONTAL,
-	WINDOW_VERTICAL,
-	WINDOW_FILE_BROWSER,
+		WINDOW_SINGULAR,
+		WINDOW_HORISONTAL,
+		WINDOW_VERTICAL,
+		WINDOW_FILE_BROWSER,
 };
 
 struct window_split_node {
-	struct window_buffer wb;
-	enum window_split_mode mode;
-	float ratio;
-	struct window_split_node *node1, *node2, *parent;
-	int minx, miny, maxx, maxy; // position informatin from the last frame
-	char* search;
-	int selected;
+		struct window_buffer wb;
+		enum window_split_mode mode;
+		float ratio;
+		struct window_split_node *node1, *node2, *parent;
+		int minx, miny, maxx, maxy; // position informatin from the last frame
+		char* search;
+		int selected;
 };
 
 enum move_directons {
-	MOVE_RIGHT,
-	MOVE_LEFT,
-	MOVE_UP,
-	MOVE_DOWN,
+		MOVE_RIGHT,
+		MOVE_LEFT,
+		MOVE_UP,
+		MOVE_DOWN,
 };
 
 ////////////////////////////////////////////////

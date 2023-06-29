@@ -25,31 +25,31 @@ void set_clipboard_copy(char* buffer, int len);
 void execute_clipbaord_event();
 
 enum glyph_attribute {
-	ATTR_NULL       = 0,
-	ATTR_BOLD       = 1 << 0,
-	ATTR_FAINT      = 1 << 1,
-	ATTR_ITALIC     = 1 << 2,
-	ATTR_UNDERLINE  = 1 << 3,
-	ATTR_REVERSE    = 1 << 5,
-	ATTR_INVISIBLE  = 1 << 6,
-	ATTR_STRUCK     = 1 << 7,
-	ATTR_WIDE       = 1 << 9,
-	ATTR_WDUMMY     = 1 << 10,
-	ATTR_BOLD_FAINT = ATTR_BOLD | ATTR_FAINT,
+		ATTR_NULL       = 0,
+		ATTR_BOLD       = 1 << 0,
+		ATTR_FAINT      = 1 << 1,
+		ATTR_ITALIC     = 1 << 2,
+		ATTR_UNDERLINE  = 1 << 3,
+		ATTR_REVERSE    = 1 << 5,
+		ATTR_INVISIBLE  = 1 << 6,
+		ATTR_STRUCK     = 1 << 7,
+		ATTR_WIDE       = 1 << 9,
+		ATTR_WDUMMY     = 1 << 10,
+		ATTR_BOLD_FAINT = ATTR_BOLD | ATTR_FAINT,
 };
 
 struct glyph {
-	rune_t  u;		// character code
-	uint16_t  mode;	// attribute flags
-	uint32_t fg;	// foreground
-	uint32_t bg;	// background
+		rune_t  u;		// character code
+		uint16_t  mode;	// attribute flags
+		uint32_t fg;	// foreground
+		uint32_t bg;	// background
 };
 
 // Internal representation of the screen
 struct screen {
-	int row;         // row count
-	int col;         // column count
-	struct glyph** lines;   // screen letters 2d array
+		int row;         // row count
+		int col;         // column count
+		struct glyph** lines;   // screen letters 2d array
 };
 
 extern struct screen screen;
@@ -68,27 +68,27 @@ void die(const char *, ...);
 // the va_args can be used to return; or any other stuff like that
 // TODO: optionally crash the program for debugging
 #define soft_assert(condition, ...)										\
-	do {																\
-		if(!(condition)) {												\
-			fprintf(stderr, "SOFT ASSERT ERROR: (%s) failed at %s %s():%d\n", #condition, __FILE__, __func__, __LINE__); \
-			writef_to_status_bar("SOFT ASSERT ERROR: (%s) failed at %s %s():%d", #condition, __FILE__, __func__, __LINE__); \
-			status_bar_bg = error_color;								\
-			__VA_ARGS__													\
-		}																\
-	} while(0)															\
+		do {															\
+				if(!(condition)) {										\
+						fprintf(stderr, "SOFT ASSERT ERROR: (%s) failed at %s %s():%d\n", #condition, __FILE__, __func__, __LINE__); \
+						writef_to_status_bar("SOFT ASSERT ERROR: (%s) failed at %s %s():%d", #condition, __FILE__, __func__, __LINE__); \
+						status_bar_bg = error_color;					\
+						__VA_ARGS__										\
+								}										\
+		} while(0)														\
 
 enum win_mode {
-	MODE_VISIBLE     = 1 << 0,
-	MODE_FOCUSED     = 1 << 1,
-	MODE_APPKEYPAD   = 1 << 2,
-	MODE_KBDLOCK     = 1 << 6,
-	MODE_HIDE        = 1 << 7,
-	MODE_APPCURSOR   = 1 << 8,
-	MODE_MOUSESGR    = 1 << 9,
-	MODE_BLINK       = 1 << 11,
-	MODE_FBLINK      = 1 << 12,
-	MODE_BRCKTPASTE  = 1 << 16,
-	MODE_NUMLOCK     = 1 << 17,
+		MODE_VISIBLE     = 1 << 0,
+		MODE_FOCUSED     = 1 << 1,
+		MODE_APPKEYPAD   = 1 << 2,
+		MODE_KBDLOCK     = 1 << 6,
+		MODE_HIDE        = 1 << 7,
+		MODE_APPCURSOR   = 1 << 8,
+		MODE_MOUSESGR    = 1 << 9,
+		MODE_BLINK       = 1 << 11,
+		MODE_FBLINK      = 1 << 12,
+		MODE_BRCKTPASTE  = 1 << 16,
+		MODE_NUMLOCK     = 1 << 17,
 };
 
 #define MIN(a, b)		((a) < (b) ? (a) : (b))
