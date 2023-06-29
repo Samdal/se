@@ -8,8 +8,8 @@
 #define LIMIT(x, a, b) (x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
 
 struct delimiter {
-    char* start;
-    char* end;
+        char* start;
+        char* end;
 };
 
 int str_contains_char(const char* string, char check);
