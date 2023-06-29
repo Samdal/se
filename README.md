@@ -1,7 +1,9 @@
 Credits
 -------
 Based on st(http://st.suckless.org/), see LICENSE file copyrights
+
 which is based on Aurélien APTEL <aurelien dot aptel at gmail dot com> bt source code.
+
 -------
 ## Features
 - buggy rendering
